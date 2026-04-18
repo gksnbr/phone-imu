@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IMU Streamer</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; line-height: 1.5; }
+        .data-box { background: #f4f4f4; padding: 15px; border-radius: 8px; margin-bottom: 10px; }
+        button { padding: 15px 25px; font-size: 16px; background: #007bff; color: white; border: none; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <h1>Phone IMU Data</h1>
+    <button id="start_button">Enable Sensors</button>
+
+    <div class="data-box">
+        <h3>Accelerometer (m/s²)</h3>
+        <p id="accel">X: 0, Y: 0, Z: 0</p>
+    </div>
+
+    <div class="data-box">
+        <h3>Gyroscope (rad/s)</h3>
+        <p id="gyro">Alpha: 0, Beta: 0, Gamma: 0</p>
+    </div>
+
+    <script>
+        const btn = document.getElementById("start_button");
+
+        btn.addEventListener("click", function() {
+            // iOS 13+ requires explicit permission
+            if (typeof DeviceMotionEvent.requestPermission === 'function') {
+                DeviceMotionEvent.requestPermission()
+                    .then(response => {
+                        if (response == 'granted') {
+                            window.addEventListener('devicemotion', handleMotion);
+                            window.addEventListener('deviceorientation', handleOrientation);
+                        }
+                    })
+                    .catch(console.error);
+            } else {
+                // Non-iOS devices
+                window.addEventListener('devicemotion', handleMotion);
+                window.addEventListener('deviceorientation', handleOrientation);
+            }
+            btn.style.display = "none";
+        });
+
+        function handleMotion(event) {
+            const a = event.accelerationIncludingGravity;
+            document.getElementById("accel").innerHTML = 
+                `X: ${a.x.toFixed(2)}, Y: ${a.y.toFixed(2)}, Z: ${a.z.toFixed(2)}`;
+        }
+
+        function handleOrientation(event) {
+            document.getElementById("gyro").innerHTML = 
+                `Alpha: ${event.alpha.toFixed(2)}, Beta: ${event.beta.toFixed(2)}, Gamma: ${event.gamma.toFixed(2)}`;
+        }
+    </script>
+</body>
+</html>
