@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IMU 6-DOF Real-time Telemetry</title>
+    <script src="https://cdn.jsdelivr.net/npm/ahrs@1.1.1/index.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gl-matrix/2.8.1/gl-matrix-min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: sans-serif; background: #121212; color: #fff; margin: 0; padding: 10px; }
+        .chart-container { position: relative; height: 30vh; width: 95vw; margin-bottom: 20px; background: #1e1e1e; border-radius: 8px; padding: 10px; }
+        button { width: 100%; padding: 15px; background: #007bff; color: white; border: none; border-radius: 8px; font-weight: bold; margin-bottom: 10px; }
+        .stats { display: flex; justify-content: space-around; font-family: monospace; font-size: 0.8rem; color: #00ff00; margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+
+    <button id="start">START TELEMETRY</button>
+    
+    <div class="stats">
+        <div id="posVal">POS: 0, 0, 0</div>
+        <div id="angVal">ANG: 0, 0, 0</div>
+    </div>
+
+    <div class="chart-container">
+        <canvas id="posChart"></canvas>
+    </div>
+
+    <div class="chart-container">
+        <canvas id="angChart"></canvas>
+    </div>
+
+    <script>
+        const { vec3 } = glMatrix;
+        const madgwick = new AHRS({ sampleInterval: 20, algorithm: 'Madgwick', beta: 0.4 });
+        
+        let position = vec3.fromValues(0, 0, 0);
+        let velocity = vec3.fromValues(0, 0, 0);
+        let lastT = 0;
+        const MAX_POINTS = 100;
+
+        // Chart Initialization
+        const chartConfig = (label, colors) => ({
+            type: 'line',
+            data: {
+                labels: Array(MAX_POINTS).fill(''),
+                datasets: ['X', 'Y', 'Z'].map((ax, i) => ({
+                    label: `${label} ${ax}`,
+                    borderColor: colors[i],
+                    data: Array(MAX_POINTS).fill(0),
+                    borderWidth: 2,
+                    pointRadius: 0
+                }))
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                animation: false,
+                scales: { y: { grid: { color: '#333' } }, x: { display: false } },
+                plugins: { legend: { labels: { color: '#fff', boxWidth: 10 } } }
+            }
+        });
+
+        const posChart = new Chart(document.getElementById('posChart'), chartConfig('Pos', ['#ff5555', '#55ff55', '#5555ff']));
+        const angChart = new Chart(document.getElementById('angChart'), chartConfig('Ang', ['#ffcc00', '#00cccc', '#ff00ff']));
+
+        document.getElementById('start').onclick = async () => {
+            if (typeof DeviceOrientationEvent.requestPermission === 'function') await DeviceOrientationEvent.requestPermission();
+            document.getElementById('start').style.display = 'none';
+            window.addEventListener('devicemotion', update);
+        };
+
+        function update(event) {
+            const now = performance.now();
+            if (lastT === 0) { lastT = now; return; }
+            const dt = (now - lastT) / 1000;
+            lastT = now;
+
+            // 1. Orientation Fusion
+            const gr = event.rotationRate;
+            const acc = event.accelerationIncludingGravity;
+            madgwick.update(gr.alpha * (Math.PI/180), gr.beta * (Math.PI/180), gr.gamma * (Math.PI/180), acc.x, acc.y, acc.z);
+
+            // 2. Position Integration (ZUPT Logic)
+            let lin_acc_body = vec3.fromValues(event.acceleration.x, event.acceleration.y, event.acceleration.z);
+            let lin_acc_world = vec3.create();
+            const q = madgwick.conj();
+            vec3.transformQuat(lin_acc_world, lin_acc_body, [q.x, q.y, q.z, q.w]);
+
+            if (vec3.length(lin_acc_body) < 0.15) {
+                vec3.scale(velocity, velocity, 0.9);
+            } else {
+                let dv = vec3.create();
+                vec3.scale(dv, lin_acc_world, dt);
+                vec3.add(velocity, velocity, dv);
+            }
+
+            let dp = vec3.create();
+            vec3.scale(dp, velocity, dt);
+            vec3.add(position, position, dp);
+
+            // 3. Update Graphs
+            const euler = madgwick.getEulerAngles();
+            updateChart(posChart, [position[0], position[1], position[2]]);
+            updateChart(angChart, [euler.pitch * 57.3, euler.roll * 57.3, euler.yaw * 57.3]);
+            
+            document.getElementById('posVal').innerText = `POS: ${position[0].toFixed(2)}, ${position[1].toFixed(2)}, ${position[2].toFixed(2)}`;
+            document.getElementById('angVal').innerText = `ANG: ${Math.round(euler.pitch*57.3)}, ${Math.round(euler.roll*57.3)}, ${Math.round(euler.yaw*57.3)}`;
+        }
+
+        function updateChart(chart, newData) {
+            chart.data.datasets.forEach((dataset, i) => {
+                dataset.data.push(newData[i]);
+                dataset.data.shift();
+            });
+            chart.update('none'); // 'none' for performance
+        }
+    </script>
+</body>
+</html>

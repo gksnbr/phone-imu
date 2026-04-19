@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Madgwick AHRS Fusion</title>
+    <script src="https://cdn.jsdelivr.net/npm/ahrs@1.1.1/index.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gl-matrix/2.8.1/gl-matrix-min.js"></script>
+    <style>
+        body { font-family: 'Courier New', monospace; background: #0a0a0a; color: #00ff41; padding: 20px; }
+        .container { border: 1px solid #00ff41; padding: 20px; border-radius: 4px; box-shadow: 0 0 15px rgba(0, 255, 65, 0.2); }
+        .data-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 20px; }
+        .stat { background: #111; padding: 10px; border: 1px solid #222; }
+        .label { font-size: 0.7rem; color: #008f11; display: block; margin-bottom: 5px; }
+        .value { font-size: 1.2rem; }
+        button { width: 100%; padding: 15px; background: #00ff41; color: #000; border: none; font-weight: bold; cursor: pointer; margin-bottom: 20px; }
+        button:active { background: #008f11; }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h2>MADGWICK AHRS ENGINE</h2>
+        <button id="start">INITIALIZE SENSORS</button>
+
+        <div class="data-grid">
+            <div class="stat">
+                <span class="label">HEADING (YAW)</span>
+                <div class="value" id="yaw">0.0°</div>
+            </div>
+            <div class="stat">
+                <span class="label">ATTITUDE (P/R)</span>
+                <div class="value" id="att">0.0°, 0.0°</div>
+            </div>
+            <div class="stat">
+                <span class="label">POSITION X,Y (M)</span>
+                <div class="value" id="posXY">0.00, 0.00</div>
+            </div>
+            <div class="stat">
+                <span class="label">VELOCITY (M/S)</span>
+                <div class="value" id="vel">0.00</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const { vec3 } = glMatrix;
+        
+        // Initialize Madgwick Filter
+        // SampleInterval: 20ms (50Hz), Beta: 0.4 (Higher = faster convergence, lower = less noise)
+        const madgwick = new AHRS({
+            sampleInterval: 20,
+            algorithm: 'Madgwick',
+            beta: 0.4
+        });
+
+        let position = vec3.fromValues(0, 0, 0);
+        let velocity = vec3.fromValues(0, 0, 0);
+        let lastT = 0;
+
+        const ZUPT_LIMIT = 0.12; 
+
+        document.getElementById('start').onclick = async () => {
+            if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+                await DeviceOrientationEvent.requestPermission();
+            }
+            document.getElementById('start').style.display = 'none';
+            window.addEventListener('devicemotion', update);
+        };
+
+        function update(event) {
+            const now = performance.now();
+            if (lastT === 0) { lastT = now; return; }
+            const dt = (now - lastT) / 1000;
+            lastT = now;
+
+            // 1. Update AHRS (Madgwick)
+            // Note: Browser rotationRate is in deg/s, ahrs expects rad/s
+            const gr = event.rotationRate;
+            const acc = event.accelerationIncludingGravity; 
+            
+            madgwick.update(
+                gr.alpha * (Math.PI/180), 
+                gr.beta * (Math.PI/180), 
+                gr.gamma * (Math.PI/180), 
+                acc.x, acc.y, acc.z
+            );
+
+            // 2. Extract Quaternion and transform Acceleration
+            const q = madgwick.conj(); // Conjugate to get World->Body or Body->World correctly
+            
+            // Get linear acceleration (remove gravity via the API or via the filter)
+            let lin_acc_body = vec3.fromValues(event.acceleration.x, event.acceleration.y, event.acceleration.z);
+            let lin_acc_world = vec3.create();
+            
+            // Rotate body acceleration to Earth Frame using Madgwick's orientation
+            // We use the gl-matrix quat format [x, y, z, w]
+            const q_gl = [q.x, q.y, q.z, q.w];
+            vec3.transformQuat(lin_acc_world, lin_acc_body, q_gl);
+
+            // 3. Position Integration with ZUPT (Zero Velocity Update)
+            let moveMag = vec3.length(lin_acc_body);
+            
+            if (moveMag < ZUPT_LIMIT) {
+                vec3.scale(velocity, velocity, 0.9); // Friction
+            } else {
+                let dv = vec3.create();
+                vec3.scale(dv, lin_acc_world, dt);
+                vec3.add(velocity, velocity, dv);
+            }
+
+            let dp = vec3.create();
+            vec3.scale(dp, velocity, dt);
+            vec3.add(position, position, dp);
+
+            render();
+        }
+
+        function render() {
+            const euler = madgwick.getEulerAngles(); // in radians
+            const toDeg = 180 / Math.PI;
+            
+            document.getElementById('yaw').innerText = (euler.yaw * toDeg).toFixed(1) + '°';
+            document.getElementById('att').innerText = `${(euler.pitch * toDeg).toFixed(1)}°, ${(euler.roll * toDeg).toFixed(1)}°`;
+            document.getElementById('posXY').innerText = `${position[0].toFixed(2)}, ${position[1].toFixed(2)}`;
+            document.getElementById('vel').innerText = vec3.length(velocity).toFixed(2) + ' m/s';
+        }
+    </script>
+</body>
+</html>
