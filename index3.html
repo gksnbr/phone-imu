@@ -3,208 +3,269 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Madgwick AHRS Fusion</title>
+    <title>ES-EKF AHRS Engine</title>
     <style>
-        body { font-family: 'Courier New', monospace; background: #0a0a0a; color: #00ff41; padding: 20px; }
-        .container { border: 1px solid #00ff41; padding: 20px; border-radius: 4px; box-shadow: 0 0 15px rgba(0, 255, 65, 0.2); }
-        .data-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 20px; }
-        .stat { background: #111; padding: 10px; border: 1px solid #222; }
-        .label { font-size: 0.7rem; color: #008f11; display: block; margin-bottom: 5px; }
-        .value { font-size: 1.2rem; }
-        button { width: 100%; padding: 15px; background: #00ff41; color: #000; border: none; font-weight: bold; cursor: pointer; margin-bottom: 20px; }
-        button:active { background: #008f11; }
-        #status { font-size: 0.7rem; color: #ff3333; margin-bottom: 10px; min-height: 1em; }
+        body{font-family:'Courier New',monospace;background:#0a0a0a;color:#00ff41;padding:20px}
+        .container{border:1px solid #00ff41;padding:20px;border-radius:4px;box-shadow:0 0 15px rgba(0,255,65,.2)}
+        .data-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:15px}
+        .stat{background:#111;padding:10px;border:1px solid #222}
+        .label{font-size:.65rem;color:#008f11;display:block;margin-bottom:4px}
+        .value{font-size:1.15rem}
+        button{width:100%;padding:15px;background:#00ff41;color:#000;border:none;font-weight:bold;cursor:pointer;margin-bottom:15px;font-size:14px}
+        button:active{background:#008f11}
+        #status{font-size:.7rem;color:#ffcc00;margin-bottom:8px;min-height:1.1em}
+        .ekf-bar{font-size:.6rem;color:#005f11;margin-top:12px;border-top:1px solid #1a1a1a;padding-top:8px}
+        .section-title{font-size:.7rem;color:#008f11;margin-top:12px;margin-bottom:4px}
+        .bias-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-top:6px}
+        .bias-cell{background:#0d0d0d;padding:6px;border:1px solid #1a1a1a;font-size:.7rem}
+        .bias-label{font-size:.55rem;color:#005f11;display:block}
     </style>
 </head>
 <body>
+<div class="container">
+    <h2>ES-EKF AHRS ENGINE</h2>
+    <div style="font-size:.6rem;color:#005f11;margin-bottom:10px">15-STATE ERROR-STATE EXTENDED KALMAN FILTER</div>
+    <button id="start">INITIALIZE SENSORS</button>
+    <div id="status"></div>
 
-    <div class="container">
-        <h2>MADGWICK AHRS ENGINE</h2>
-        <button id="start">INITIALIZE SENSORS</button>
-        <div id="status"></div>
-
-        <div class="data-grid">
-            <div class="stat">
-                <span class="label">HEADING (YAW)</span>
-                <div class="value" id="yaw">0.0°</div>
-            </div>
-            <div class="stat">
-                <span class="label">ATTITUDE (P/R)</span>
-                <div class="value" id="att">0.0°, 0.0°</div>
-            </div>
-            <div class="stat">
-                <span class="label">POSITION X,Y (CM)</span>
-                <div class="value" id="posXY">0.00, 0.00</div>
-            </div>
-            <div class="stat">
-                <span class="label">VELOCITY (CM/S)</span>
-                <div class="value" id="vel">0.00</div>
-            </div>
+    <div class="data-grid">
+        <div class="stat">
+            <span class="label">HEADING (YAW)</span>
+            <div class="value" id="yaw">0.0°</div>
+        </div>
+        <div class="stat">
+            <span class="label">ATTITUDE (P / R)</span>
+            <div class="value" id="att">0.0°, 0.0°</div>
+        </div>
+        <div class="stat">
+            <span class="label">POSITION X, Y (CM)</span>
+            <div class="value" id="posXY">0.0, 0.0</div>
+        </div>
+        <div class="stat">
+            <span class="label">POSITION Z (CM)</span>
+            <div class="value" id="posZ">0.0</div>
+        </div>
+        <div class="stat">
+            <span class="label">VELOCITY (CM/S)</span>
+            <div class="value" id="vel">0.0</div>
+        </div>
+        <div class="stat">
+            <span class="label">EKF STATE</span>
+            <div class="value" id="ekfState">INIT</div>
         </div>
     </div>
 
-    <script>
-    // ── Inline vec3 helpers ──────────────────────────────────────
-    const V3 = {
-        create: () => [0, 0, 0],
-        from: (x, y, z) => [x, y, z],
-        len: (v) => Math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]),
-        scale: (out, v, s) => { out[0]=v[0]*s; out[1]=v[1]*s; out[2]=v[2]*s; return out; },
-        add: (out, a, b) => { out[0]=a[0]+b[0]; out[1]=a[1]+b[1]; out[2]=a[2]+b[2]; return out; },
-        transformQuat: (out, v, q) => {
-            const x=v[0], y=v[1], z=v[2];
-            const qx=q[0], qy=q[1], qz=q[2], qw=q[3];
-            const ix = qw*x + qy*z - qz*y;
-            const iy = qw*y + qz*x - qx*z;
-            const iz = qw*z + qx*y - qy*x;
-            const iw = -qx*x - qy*y - qz*z;
-            out[0] = ix*qw + iw*-qx + iy*-qz - iz*-qy;
-            out[1] = iy*qw + iw*-qy + iz*-qx - ix*-qz;
-            out[2] = iz*qw + iw*-qz + ix*-qy - iy*-qx;
-            return out;
+    <div class="section-title">ESTIMATED BIASES</div>
+    <div class="bias-grid">
+        <div class="bias-cell"><span class="bias-label">GYRO X</span><span id="bgx">0</span> °/s</div>
+        <div class="bias-cell"><span class="bias-label">GYRO Y</span><span id="bgy">0</span> °/s</div>
+        <div class="bias-cell"><span class="bias-label">GYRO Z</span><span id="bgz">0</span> °/s</div>
+        <div class="bias-cell"><span class="bias-label">ACC X</span><span id="bax">0</span> cm/s²</div>
+        <div class="bias-cell"><span class="bias-label">ACC Y</span><span id="bay">0</span> cm/s²</div>
+        <div class="bias-cell"><span class="bias-label">ACC Z</span><span id="baz">0</span> cm/s²</div>
+    </div>
+
+    <div class="ekf-bar" id="ekfBar">dt: — · samples: 0</div>
+</div>
+
+<script>
+"use strict";
+
+// ═══════════════════════════════════════════════════════════════
+// MATRIX / VECTOR UTILITIES
+// ═══════════════════════════════════════════════════════════════
+const N=15;
+function mat(r,c){return new Float64Array(r*c)}
+function eye(n){const m=mat(n,n);for(let i=0;i<n;i++) m[i*n+i]=1;return m}
+function mmul(A,B,ra,ca,cb){const C=mat(ra,cb);for(let i=0;i<ra;i++)for(let j=0;j<cb;j++){let s=0;for(let k=0;k<ca;k++)s+=A[i*ca+k]*B[k*cb+j];C[i*cb+j]=s}return C}
+function mtrans(A,r,c){const T=mat(c,r);for(let i=0;i<r;i++)for(let j=0;j<c;j++)T[j*r+i]=A[i*c+j];return T}
+function inv3(M){const[a,b,c,d,e,f,g,h,k]=M;const A=e*k-f*h,B=-(d*k-f*g),C=d*h-e*g,D=-(b*k-c*h),E=a*k-c*g,F=-(a*h-b*g),G=b*f-c*e,H=-(a*f-c*d),K=a*e-b*d;const det=a*A+b*B+c*C;if(Math.abs(det)<1e-15)return eye(3);const id=1/det;return new Float64Array([A*id,D*id,G*id,B*id,E*id,H*id,C*id,F*id,K*id])}
+
+// ═══════════════════════════════════════════════════════════════
+// QUATERNION [w, x, y, z]
+// ═══════════════════════════════════════════════════════════════
+function qmul(a,b){return[a[0]*b[0]-a[1]*b[1]-a[2]*b[2]-a[3]*b[3],a[0]*b[1]+a[1]*b[0]+a[2]*b[3]-a[3]*b[2],a[0]*b[2]-a[1]*b[3]+a[2]*b[0]+a[3]*b[1],a[0]*b[3]+a[1]*b[2]-a[2]*b[1]+a[3]*b[0]]}
+function qnorm(q){const n=Math.sqrt(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3])||1;return[q[0]/n,q[1]/n,q[2]/n,q[3]/n]}
+function qfromrv(rv){const a=Math.sqrt(rv[0]*rv[0]+rv[1]*rv[1]+rv[2]*rv[2]);if(a<1e-10)return[1,rv[0]*.5,rv[1]*.5,rv[2]*.5];const h=a*.5,s=Math.sin(h)/a;return[Math.cos(h),rv[0]*s,rv[1]*s,rv[2]*s]}
+function q2R(q){const[w,x,y,z]=q;return new Float64Array([1-2*(y*y+z*z),2*(x*y-w*z),2*(x*z+w*y),2*(x*y+w*z),1-2*(x*x+z*z),2*(y*z-w*x),2*(x*z-w*y),2*(y*z+w*x),1-2*(x*x+y*y)])}
+function Rv(R,v){return[R[0]*v[0]+R[1]*v[1]+R[2]*v[2],R[3]*v[0]+R[4]*v[1]+R[5]*v[2],R[6]*v[0]+R[7]*v[1]+R[8]*v[2]]}
+function q2euler(q){const[w,x,y,z]=q;const d=180/Math.PI;const roll=Math.atan2(2*(w*x+y*z),1-2*(x*x+y*y));const sp=2*(w*y-z*x);const pitch=Math.abs(sp)>=1?Math.sign(sp)*90:Math.asin(sp)*d;const yaw=Math.atan2(2*(w*z+x*y),1-2*(y*y+z*z));return{pitch:pitch,roll:roll*d,yaw:yaw*d}}
+function skew(v){return new Float64Array([0,-v[2],v[1],v[2],0,-v[0],-v[1],v[0],0])}
+
+// ═══════════════════════════════════════════════════════════════
+// ES-EKF
+// ═══════════════════════════════════════════════════════════════
+class ESEKF{
+    constructor(){
+        this.q=[1,0,0,0]; this.p=[0,0,0]; this.v=[0,0,0]; this.bg=[0,0,0]; this.ba=[0,0,0];
+        this.P=eye(N);
+        for(let i=0;i<3;i++){this.P[i*N+i]=.1;this.P[(3+i)*N+(3+i)]=.01;this.P[(6+i)*N+(6+i)]=.01;this.P[(9+i)*N+(9+i)]=.001;this.P[(12+i)*N+(12+i)]=.01}
+        this.sg=.015;this.sa=.15;this.sbg=.0003;this.sba=.003;
+        this.Rz=new Float64Array([.01,0,0,0,.01,0,0,0,.01]);
+        this.accBuf=[];this.gyrBuf=[];this.bufSz=25;this.isStationary=false;
+        this.g=[0,0,9.81];
+        this.calN=0;this.calA=[0,0,0];this.calG=[0,0,0];this.calibrated=false;this.calTarget=80;
+    }
+    calibrate(gyr,acc){
+        this.calG[0]+=gyr[0];this.calG[1]+=gyr[1];this.calG[2]+=gyr[2];
+        this.calA[0]+=acc[0];this.calA[1]+=acc[1];this.calA[2]+=acc[2];
+        this.calN++;
+        if(this.calN>=this.calTarget){
+            const n=this.calN;
+            this.bg=[this.calG[0]/n,this.calG[1]/n,this.calG[2]/n];
+            const ma=[this.calA[0]/n,this.calA[1]/n,this.calA[2]/n];
+            const gn=Math.sqrt(ma[0]*ma[0]+ma[1]*ma[1]+ma[2]*ma[2]);
+            this.g=[0,0,gn||9.81];
+            const gb=[ma[0]/gn,ma[1]/gn,ma[2]/gn];
+            const dot=gb[2];
+            if(dot>.999)this.q=[1,0,0,0];
+            else if(dot<-.999)this.q=[0,1,0,0];
+            else this.q=qnorm([1+dot,-gb[1],gb[0],0]);
+            this.calibrated=true;
         }
-    };
-
-    // ── Inline Madgwick AHRS filter ──────────────────────────────
-    class MadgwickAHRS {
-        constructor(beta = 0.4) {
-            this.beta = beta;
-            this.q = [1, 0, 0, 0]; // w, x, y, z
+        return this.calibrated;
+    }
+    detectStationary(gyr,acc){
+        this.accBuf.push([acc[0],acc[1],acc[2]]);this.gyrBuf.push([gyr[0],gyr[1],gyr[2]]);
+        if(this.accBuf.length>this.bufSz)this.accBuf.shift();
+        if(this.gyrBuf.length>this.bufSz)this.gyrBuf.shift();
+        if(this.accBuf.length<this.bufSz)return false;
+        let mx=0,my=0,mz=0;
+        for(const a of this.accBuf){mx+=a[0];my+=a[1];mz+=a[2]}
+        mx/=this.bufSz;my/=this.bufSz;mz/=this.bufSz;
+        let vx=0,vy=0,vz=0;
+        for(const a of this.accBuf){vx+=(a[0]-mx)**2;vy+=(a[1]-my)**2;vz+=(a[2]-mz)**2}
+        const aVar=(vx+vy+vz)/this.bufSz;
+        const lg=this.gyrBuf[this.gyrBuf.length-1];
+        const gMag=Math.sqrt(lg[0]**2+lg[1]**2+lg[2]**2);
+        this.isStationary=(aVar<.3)&&(gMag<.6);
+        return this.isStationary;
+    }
+    predict(gyr,acc,dt){
+        const wc=[gyr[0]-this.bg[0],gyr[1]-this.bg[1],gyr[2]-this.bg[2]];
+        const ac=[acc[0]-this.ba[0],acc[1]-this.ba[1],acc[2]-this.ba[2]];
+        this.q=qnorm(qmul(this.q,qfromrv([wc[0]*dt,wc[1]*dt,wc[2]*dt])));
+        const R=q2R(this.q);
+        const aw=Rv(R,ac);
+        aw[0]-=this.g[0];aw[1]-=this.g[1];aw[2]-=this.g[2];
+        this.p[0]+=this.v[0]*dt+.5*aw[0]*dt*dt;
+        this.p[1]+=this.v[1]*dt+.5*aw[1]*dt*dt;
+        this.p[2]+=this.v[2]*dt+.5*aw[2]*dt*dt;
+        this.v[0]+=aw[0]*dt;this.v[1]+=aw[1]*dt;this.v[2]+=aw[2]*dt;
+        const Phi=eye(N);const sw=skew(wc);const Rsa=mmul(R,skew(ac),3,3,3);
+        for(let i=0;i<3;i++)for(let j=0;j<3;j++){
+            Phi[i*N+j]+=-sw[i*3+j]*dt;
+            Phi[i*N+(9+j)]+=-(i===j?1:0)*dt;
+            Phi[(3+i)*N+(6+j)]+=(i===j?1:0)*dt;
+            Phi[(6+i)*N+j]+=-Rsa[i*3+j]*dt;
+            Phi[(6+i)*N+(12+j)]+=-R[i*3+j]*dt;
         }
+        const Q=mat(N,N);
+        const sg2=this.sg**2,sa2=this.sa**2,sbg2=this.sbg**2,sba2=this.sba**2;
+        for(let i=0;i<3;i++){Q[i*N+i]=sg2*dt;Q[(6+i)*N+(6+i)]=sa2*dt;Q[(9+i)*N+(9+i)]=sbg2*dt;Q[(12+i)*N+(12+i)]=sba2*dt}
+        const PhiP=mmul(Phi,this.P,N,N,N);
+        const Pn=mmul(PhiP,mtrans(Phi,N,N),N,N,N);
+        for(let i=0;i<N*N;i++)Pn[i]+=Q[i];
+        this.P=Pn;
+        for(let i=0;i<N;i++)for(let j=i+1;j<N;j++){const a=.5*(this.P[i*N+j]+this.P[j*N+i]);this.P[i*N+j]=a;this.P[j*N+i]=a}
+    }
+    zupt(){
+        const z=[-this.v[0],-this.v[1],-this.v[2]];
+        const S=new Float64Array(9);
+        for(let i=0;i<3;i++)for(let j=0;j<3;j++)S[i*3+j]=this.P[(6+i)*N+(6+j)]+this.Rz[i*3+j];
+        const Si=inv3(S);
+        const PH=mat(N,3);
+        for(let i=0;i<N;i++)for(let j=0;j<3;j++)PH[i*3+j]=this.P[i*N+(6+j)];
+        const K=mmul(PH,Si,N,3,3);
+        const dx=new Float64Array(N);
+        for(let i=0;i<N;i++)dx[i]=K[i*3]*z[0]+K[i*3+1]*z[1]+K[i*3+2]*z[2];
+        const KH=mat(N,N);
+        for(let i=0;i<N;i++)for(let j=0;j<3;j++)KH[i*N+(6+j)]=K[i*3+j];
+        const IKH=eye(N);for(let i=0;i<N*N;i++)IKH[i]-=KH[i];
+        this.P=mmul(IKH,this.P,N,N,N);
+        this.q=qnorm(qmul(this.q,qfromrv([dx[0],dx[1],dx[2]])));
+        this.p[0]+=dx[3];this.p[1]+=dx[4];this.p[2]+=dx[5];
+        this.v[0]+=dx[6];this.v[1]+=dx[7];this.v[2]+=dx[8];
+        this.bg[0]+=dx[9];this.bg[1]+=dx[10];this.bg[2]+=dx[11];
+        this.ba[0]+=dx[12];this.ba[1]+=dx[13];this.ba[2]+=dx[14];
+    }
+}
 
-        update(gx, gy, gz, ax, ay, az, dt) {
-            let [qw, qx, qy, qz] = this.q;
+// ═══════════════════════════════════════════════════════════════
+// APPLICATION
+// ═══════════════════════════════════════════════════════════════
+const statusEl=document.getElementById('status');
+const ekf=new ESEKF();
+let lastT=0, sampleCount=0;
+const HP_A=.8; let gravEst=null;
 
-            let norm = Math.sqrt(ax*ax + ay*ay + az*az);
-            if (norm === 0) return;
-            ax /= norm; ay /= norm; az /= norm;
+document.getElementById('start').onclick=async()=>{
+    try{if(typeof DeviceMotionEvent!=='undefined'&&typeof DeviceMotionEvent.requestPermission==='function')await DeviceMotionEvent.requestPermission()}catch(e){statusEl.innerText='Permission: '+e.message}
+    document.getElementById('start').style.display='none';
+    statusEl.innerText='Calibrating — hold still...';
+    window.addEventListener('devicemotion',onMotion);
+};
 
-            const _2qw=2*qw, _2qx=2*qx, _2qy=2*qy, _2qz=2*qz;
-            const _4qw=4*qw, _4qx=4*qx, _4qy=4*qy;
-            const _8qx=8*qx, _8qy=8*qy;
-            const qwqw=qw*qw, qxqx=qx*qx, qyqy=qy*qy, qzqz=qz*qz;
+function getLinAcc(ev){
+    if(ev.acceleration&&ev.acceleration.x!=null)return[ev.acceleration.x,ev.acceleration.y,ev.acceleration.z];
+    const ag=ev.accelerationIncludingGravity;if(!ag||ag.x==null)return null;
+    if(!gravEst)gravEst={x:ag.x,y:ag.y,z:ag.z};
+    gravEst.x=HP_A*gravEst.x+(1-HP_A)*ag.x;gravEst.y=HP_A*gravEst.y+(1-HP_A)*ag.y;gravEst.z=HP_A*gravEst.z+(1-HP_A)*ag.z;
+    return[ag.x-gravEst.x,ag.y-gravEst.y,ag.z-gravEst.z];
+}
 
-            let s0 = _4qw*qyqy + _2qy*ax + _4qw*qxqx - _2qx*ay;
-            let s1 = _4qx*qzqz - _2qz*ax + 4*qwqw*qx - _2qw*ay - _4qx + _8qx*qxqx + _8qx*qyqy + _4qx*az;
-            let s2 = 4*qwqw*qy + _2qw*ax + _4qy*qzqz - _2qz*ay - _4qy + _8qy*qxqx + _8qy*qyqy + _4qy*az;
-            let s3 = 4*qxqx*qz - _2qx*ax + 4*qyqy*qz - _2qy*ay;
+function onMotion(ev){
+    const now=performance.now();
+    if(lastT===0){lastT=now;return}
+    const dt=(now-lastT)/1000;lastT=now;
+    if(dt>.5||dt<.001)return;
 
-            norm = Math.sqrt(s0*s0 + s1*s1 + s2*s2 + s3*s3);
-            if (norm > 0) { s0/=norm; s1/=norm; s2/=norm; s3/=norm; }
+    const gr=ev.rotationRate,accIG=ev.accelerationIncludingGravity;
+    if(!gr||!accIG){statusEl.innerText='No sensor data';return}
+    if(gr.alpha==null||accIG.x==null){statusEl.innerText='Null values';return}
 
-            const qDot0 = 0.5*(-qx*gx - qy*gy - qz*gz) - this.beta*s0;
-            const qDot1 = 0.5*( qw*gx + qy*gz - qz*gy) - this.beta*s1;
-            const qDot2 = 0.5*( qw*gy - qx*gz + qz*gx) - this.beta*s2;
-            const qDot3 = 0.5*( qw*gz + qx*gy - qy*gx) - this.beta*s3;
+    const gyr=[gr.alpha*(Math.PI/180),gr.beta*(Math.PI/180),gr.gamma*(Math.PI/180)];
+    const accFull=[accIG.x,accIG.y,accIG.z];
+    sampleCount++;
 
-            qw += qDot0*dt; qx += qDot1*dt; qy += qDot2*dt; qz += qDot3*dt;
-            norm = Math.sqrt(qw*qw + qx*qx + qy*qy + qz*qz);
-            this.q = [qw/norm, qx/norm, qy/norm, qz/norm];
-        }
-
-        getQuatConjXYZW() {
-            const [w, x, y, z] = this.q;
-            return [-x, -y, -z, w];
-        }
-
-        getEulerDeg() {
-            const [w, x, y, z] = this.q;
-            const sinr = 2*(w*x + y*z), cosr = 1 - 2*(x*x + y*y);
-            const roll = Math.atan2(sinr, cosr);
-            const sinp = 2*(w*y - z*x);
-            const pitch = Math.abs(sinp) >= 1 ? Math.sign(sinp)*Math.PI/2 : Math.asin(sinp);
-            const siny = 2*(w*z + x*y), cosy = 1 - 2*(y*y + z*z);
-            const yaw = Math.atan2(siny, cosy);
-            const d = 180/Math.PI;
-            return { pitch: pitch*d, roll: roll*d, yaw: yaw*d };
-        }
+    if(!ekf.calibrated){
+        ekf.calibrate(gyr,accFull);
+        statusEl.innerText=`Calibrating — hold still... ${Math.round(ekf.calN/ekf.calTarget*100)}%`;
+        return;
     }
 
-    // ── Main app ─────────────────────────────────────────────────
-    const statusEl = document.getElementById('status');
-    const madgwick = new MadgwickAHRS(0.4);
+    const linAcc=getLinAcc(ev)||[0,0,0];
+    ekf.detectStationary(gyr,linAcc);
+    ekf.predict(gyr,accFull,dt);
+    if(ekf.isStationary) ekf.zupt();
 
-    let position = [0, 0, 0];
-    let velocity = [0, 0, 0];
-    let lastT = 0;
-    const ZUPT_LIMIT = 0.12;
+    const vMag=Math.sqrt(ekf.v[0]**2+ekf.v[1]**2+ekf.v[2]**2);
+    if(vMag<.02&&ekf.isStationary){ekf.v[0]*=.5;ekf.v[1]*=.5;ekf.v[2]*=.5}
 
-    const HP_ALPHA = 0.8;
-    let grav = null;
+    const e=q2euler(ekf.q);
+    const d2r=180/Math.PI;
 
-    document.getElementById('start').onclick = async () => {
-        try {
-            if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function')
-                await DeviceMotionEvent.requestPermission();
-        } catch(e) { statusEl.innerText = 'Permission error: ' + e.message; }
-        document.getElementById('start').style.display = 'none';
-        statusEl.innerText = 'Waiting for sensor data...';
-        window.addEventListener('devicemotion', onMotion);
-    };
+    document.getElementById('yaw').innerText=e.yaw.toFixed(1)+'°';
+    document.getElementById('att').innerText=`${e.pitch.toFixed(1)}°, ${e.roll.toFixed(1)}°`;
+    document.getElementById('posXY').innerText=`${(ekf.p[0]*100).toFixed(1)}, ${(ekf.p[1]*100).toFixed(1)}`;
+    document.getElementById('posZ').innerText=(ekf.p[2]*100).toFixed(1)+' cm';
+    document.getElementById('vel').innerText=(vMag*100).toFixed(1)+' cm/s';
 
-    function getLinearAccel(event) {
-        if (event.acceleration && event.acceleration.x != null)
-            return V3.from(event.acceleration.x, event.acceleration.y, event.acceleration.z);
+    // Biases
+    document.getElementById('bgx').innerText=(ekf.bg[0]*d2r).toFixed(3);
+    document.getElementById('bgy').innerText=(ekf.bg[1]*d2r).toFixed(3);
+    document.getElementById('bgz').innerText=(ekf.bg[2]*d2r).toFixed(3);
+    document.getElementById('bax').innerText=(ekf.ba[0]*100).toFixed(2);
+    document.getElementById('bay').innerText=(ekf.ba[1]*100).toFixed(2);
+    document.getElementById('baz').innerText=(ekf.ba[2]*100).toFixed(2);
 
-        const ag = event.accelerationIncludingGravity;
-        if (!ag || ag.x == null) return null;
-        if (!grav) grav = { x: ag.x, y: ag.y, z: ag.z };
-
-        grav.x = HP_ALPHA * grav.x + (1 - HP_ALPHA) * ag.x;
-        grav.y = HP_ALPHA * grav.y + (1 - HP_ALPHA) * ag.y;
-        grav.z = HP_ALPHA * grav.z + (1 - HP_ALPHA) * ag.z;
-
-        return V3.from(ag.x - grav.x, ag.y - grav.y, ag.z - grav.z);
-    }
-
-    function onMotion(event) {
-        const now = performance.now();
-        if (lastT === 0) { lastT = now; return; }
-        const dt = (now - lastT) / 1000;
-        lastT = now;
-
-        const gr = event.rotationRate;
-        const acc = event.accelerationIncludingGravity;
-        if (!gr || !acc) { statusEl.innerText = 'No sensor data'; return; }
-        if (gr.alpha == null || acc.x == null) { statusEl.innerText = 'Null sensor values'; return; }
-
-        statusEl.innerText = '';
-
-        madgwick.update(
-            gr.alpha * (Math.PI/180),
-            gr.beta  * (Math.PI/180),
-            gr.gamma * (Math.PI/180),
-            acc.x, acc.y, acc.z, dt
-        );
-
-        const linAcc = getLinearAccel(event);
-        if (!linAcc) return;
-
-        const linWorld = V3.create();
-        V3.transformQuat(linWorld, linAcc, madgwick.getQuatConjXYZW());
-
-        if (V3.len(linAcc) < ZUPT_LIMIT) {
-            V3.scale(velocity, velocity, 0.9);
-        } else {
-            const dv = V3.create();
-            V3.scale(dv, linWorld, dt);
-            V3.add(velocity, velocity, dv);
-        }
-
-        const dp = V3.create();
-        V3.scale(dp, velocity, dt);
-        V3.add(position, position, dp);
-
-        render();
-    }
-
-    function render() {
-        const e = madgwick.getEulerDeg();
-        document.getElementById('yaw').innerText = e.yaw.toFixed(1) + '°';
-        document.getElementById('att').innerText = `${e.pitch.toFixed(1)}°, ${e.roll.toFixed(1)}°`;
-        document.getElementById('posXY').innerText = `${(position[0]*100).toFixed(1)}, ${(position[1]*100).toFixed(1)}`;
-        document.getElementById('vel').innerText = (V3.len(velocity)*100).toFixed(1) + ' cm/s';
-    }
-    </script>
+    const st=ekf.isStationary?'ZUPT':'MOVING';
+    document.getElementById('ekfState').innerText=st;
+    document.getElementById('ekfState').style.color=ekf.isStationary?'#00ff41':'#ffcc00';
+    statusEl.innerText=ekf.isStationary?'■ STATIONARY — ZUPT ACTIVE':'▶ MOTION DETECTED';
+    statusEl.style.color=ekf.isStationary?'#00ff41':'#ffcc00';
+    document.getElementById('ekfBar').innerText=`dt: ${(dt*1000).toFixed(0)}ms · samples: ${sampleCount} · P_diag: ${Math.sqrt(ekf.P[3*N+3]).toFixed(4)}`;
+}
+</script>
 </body>
 </html>
