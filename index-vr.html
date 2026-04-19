@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebXR VIO Tracker</title>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: sans-serif; background: #000; }
+        #ui { position: absolute; top: 20px; left: 20px; z-index: 10; color: #00ff00; pointer-events: none; }
+        .val { font-family: monospace; font-size: 1.5rem; margin-bottom: 10px; text-shadow: 2px 2px #000; }
+        button { 
+            position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%);
+            padding: 20px 40px; font-size: 1.2rem; background: #007bff; color: white; 
+            border: none; border-radius: 50px; cursor: pointer; z-index: 100;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui">
+        <div>TRUE WORLD POSITION (METERS)</div>
+        <div class="val" id="pos">X: 0.00, Y: 0.00, Z: 0.00</div>
+        <div>ROTATION (QUATERNION)</div>
+        <div class="val" id="rot">W: 1, X: 0, Y: 0, Z: 0</div>
+    </div>
+
+    <button id="activate">START AR TRACKING</button>
+
+    <script type="module">
+        let xrSession = null;
+        let xrRefSpace = null;
+
+        const posEl = document.getElementById('pos');
+        const rotEl = document.getElementById('rot');
+        const btn = document.getElementById('activate');
+
+        btn.addEventListener('click', () => {
+            if (!xrSession) {
+                navigator.xr.requestSession('immersive-ar', {
+                    requiredFeatures: ['local-floor']
+                }).then(onSessionStarted);
+            }
+        });
+
+        function onSessionStarted(session) {
+            xrSession = session;
+            btn.style.display = 'none';
+
+            // Create a webgl context for the AR background
+            const canvas = document.createElement('canvas');
+            const gl = canvas.getContext('webgl', { xrCompatible: true });
+
+            session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+            session.requestReferenceSpace('local-floor').then((refSpace) => {
+                xrRefSpace = refSpace;
+                session.requestAnimationFrame(onXRFrame);
+            });
+        }
+
+        function onXRFrame(t, frame) {
+            const session = frame.session;
+            session.requestAnimationFrame(onXRFrame);
+
+            const viewerPose = frame.getViewerPose(xrRefSpace);
+            if (viewerPose) {
+                const pos = viewerPose.transform.position;
+                const ori = viewerPose.transform.orientation;
+
+                // Update UI with Centimeter-level accuracy
+                posEl.innerText = `X: ${pos.x.toFixed(3)}m, Y: ${pos.y.toFixed(3)}m, Z: ${pos.z.toFixed(3)}m`;
+                rotEl.innerText = `W: ${ori.w.toFixed(2)}, X: ${ori.x.toFixed(2)}, Y: ${ori.y.toFixed(2)}, Z: ${ori.z.toFixed(2)}`;
+            }
+        }
+    </script>
+</body>
+</html>
