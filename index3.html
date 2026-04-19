@@ -33,11 +33,11 @@
                 <div class="value" id="att">0.0°, 0.0°</div>
             </div>
             <div class="stat">
-                <span class="label">POSITION X,Y (M)</span>
+                <span class="label">POSITION X,Y (CM)</span>
                 <div class="value" id="posXY">0.00, 0.00</div>
             </div>
             <div class="stat">
-                <span class="label">VELOCITY (M/S)</span>
+                <span class="label">VELOCITY (CM/S)</span>
                 <div class="value" id="vel">0.00</div>
             </div>
         </div>
@@ -202,8 +202,8 @@
         const e = madgwick.getEulerDeg();
         document.getElementById('yaw').innerText = e.yaw.toFixed(1) + '°';
         document.getElementById('att').innerText = `${e.pitch.toFixed(1)}°, ${e.roll.toFixed(1)}°`;
-        document.getElementById('posXY').innerText = `${position[0].toFixed(2)}, ${position[1].toFixed(2)}`;
-        document.getElementById('vel').innerText = V3.len(velocity).toFixed(2) + ' m/s';
+        document.getElementById('posXY').innerText = `${(position[0]*100).toFixed(1)}, ${(position[1]*100).toFixed(1)}`;
+        document.getElementById('vel').innerText = (V3.len(velocity)*100).toFixed(1) + ' cm/s';
     }
     </script>
 </body>
