@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EKF+DNN+VIO Telemetry</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:sans-serif;background:#121212;color:#fff;padding:8px}
+canvas.chart{width:100%;background:#1e1e1e;border-radius:8px;margin-bottom:6px;display:block}
+button{width:100%;padding:13px;background:#007bff;color:#fff;border:none;border-radius:8px;font-weight:bold;margin-bottom:8px;font-size:14px}
+.stats{display:flex;justify-content:space-around;font-family:monospace;font-size:.68rem;color:#0f0;margin-bottom:6px;flex-wrap:wrap}
+.stats div{margin:2px 3px}
+#status{font-size:.65rem;color:#ff5555;margin-bottom:6px;font-family:monospace;min-height:1em}
+.lbl{font-size:.6rem;color:#888;margin-bottom:2px;font-family:monospace}
+.box{border:1px solid;border-radius:6px;padding:6px;margin-bottom:6px;font-family:monospace;font-size:.6rem}
+.dnn{background:#0d0d2a;border-color:#1a1a4a;color:#0af}
+.vio{background:#2a0d2a;border-color:#4a1a4a;color:#f4c}
+.title{font-weight:bold;margin-bottom:3px;font-size:.65rem}
+.dnn .title{color:#0af}.vio .title{color:#f4c}
+.tag{display:inline-block;padding:1px 5px;border-radius:3px;font-size:.52rem;font-weight:bold;margin-left:5px}
+.row{display:flex;justify-content:space-between;flex-wrap:wrap;gap:4px}
+#vioPanel{display:flex;gap:6px;align-items:flex-start;margin-top:4px}
+.vw{position:relative;width:80px;height:60px;flex-shrink:0}
+#vioPreview{width:80px;height:60px;background:#000;border:1px solid #333;display:block}
+#flowCanvas{width:80px;height:60px;position:absolute;top:0;left:0;pointer-events:none}
+.vi{flex:1;font-size:.55rem;line-height:1.35}
+</style>
+</head>
+<body>
+<button id="start">START EKF+DNN+VIO</button>
+<div id="status"></div>
+
+<div class="box dnn">
+<div class="title">NEURAL NET <span class="tag" id="dnnMode" style="background:#333;color:#888">IDLE</span></div>
+<div class="row"><span id="dnnTrain">Samples: 0</span><span id="dnnLoss">Loss: —</span><span id="dnnConf">Conf: —</span></div>
+</div>
+
+<div class="box vio">
+<div class="title">VISUAL-INERTIAL <span class="tag" id="vioMode" style="background:#333;color:#888">OFF</span></div>
+<div id="vioPanel">
+<div class="vw"><canvas id="vioPreview" width="80" height="60"></canvas><canvas id="flowCanvas" width="80" height="60"></canvas></div>
+<div class="vi">
+<div id="vioFlow">Flow: 0, 0 px</div>
+<div id="vioVel">Vel: 0, 0 cm/s</div>
+<div id="vioConf">Tracks: 0 | —</div>
+<div id="vioInfo" style="color:#663366;font-size:.5rem">req. HTTPS/localhost</div>
+</div>
+</div>
+</div>
+
+<div class="stats">
+<div id="posVal">POS: 0, 0, 0 cm</div>
+<div id="angVal">ANG: 0, 0, 0°</div>
+<div id="velVal">VEL: 0 cm/s</div>
+</div>
+
+<div class="lbl">POSITION (cm) — <span style="color:#ff5555">X</span> <span style="color:#55ff55">Y</span> <span style="color:#5555ff">Z</span></div>
+<canvas id="posChart" class="chart" height="140"></canvas>
+<div class="lbl">EULER (°) — <span style="color:#ffcc00">P</span> <span style="color:#00cccc">R</span> <span style="color:#ff00ff">Y</span></div>
+<canvas id="angChart" class="chart" height="140"></canvas>
+<div class="lbl">VIO vs DNN VELOCITY (cm/s) — <span style="color:#f4c">VIO-X</span> <span style="color:#0af">DNN-X</span></div>
+<canvas id="velChart" class="chart" height="110"></canvas>
+
+<video id="cam" playsinline autoplay style="display:none"></video>
+
+<script>
+"use strict";
+// ═══ MATRIX ═══
+const NS=15;
+const mat=(r,c)=>new Float64Array(r*c);
+const eye=n=>{const m=mat(n,n);for(let i=0;i<n;i++)m[i*n+i]=1;return m};
+function mmul(A,B,ra,ca,cb){const C=mat(ra,cb);for(let i=0;i<ra;i++)for(let j=0;j<cb;j++){let s=0;for(let k=0;k<ca;k++)s+=A[i*ca+k]*B[k*cb+j];C[i*cb+j]=s}return C}
+function mtrans(A,r,c){const T=mat(c,r);for(let i=0;i<r;i++)for(let j=0;j<c;j++)T[j*r+i]=A[i*c+j];return T}
+function inv3(M){const[a,b,c,d,e,f,g,h,k]=M;const A=e*k-f*h,B=-(d*k-f*g),C=d*h-e*g,D=-(b*k-c*h),E=a*k-c*g,F=-(a*h-b*g),G=b*f-c*e,H=-(a*f-c*d),K=a*e-b*d;const det=a*A+b*B+c*C;if(Math.abs(det)<1e-15)return eye(3);const id=1/det;return new Float64Array([A*id,D*id,G*id,B*id,E*id,H*id,C*id,F*id,K*id])}
+
+// ═══ QUATERNION ═══
+const qmul=(a,b)=>[a[0]*b[0]-a[1]*b[1]-a[2]*b[2]-a[3]*b[3],a[0]*b[1]+a[1]*b[0]+a[2]*b[3]-a[3]*b[2],a[0]*b[2]-a[1]*b[3]+a[2]*b[0]+a[3]*b[1],a[0]*b[3]+a[1]*b[2]-a[2]*b[1]+a[3]*b[0]];
+const qnorm=q=>{const n=Math.sqrt(q[0]**2+q[1]**2+q[2]**2+q[3]**2)||1;return[q[0]/n,q[1]/n,q[2]/n,q[3]/n]};
+const qfromrv=r=>{const a=Math.sqrt(r[0]**2+r[1]**2+r[2]**2);if(a<1e-10)return[1,r[0]*.5,r[1]*.5,r[2]*.5];const h=a*.5,s=Math.sin(h)/a;return[Math.cos(h),r[0]*s,r[1]*s,r[2]*s]};
+const q2R=q=>{const[w,x,y,z]=q;return new Float64Array([1-2*(y*y+z*z),2*(x*y-w*z),2*(x*z+w*y),2*(x*y+w*z),1-2*(x*x+z*z),2*(y*z-w*x),2*(x*z-w*y),2*(y*z+w*x),1-2*(x*x+y*y)])};
+const Rv=(R,v)=>[R[0]*v[0]+R[1]*v[1]+R[2]*v[2],R[3]*v[0]+R[4]*v[1]+R[5]*v[2],R[6]*v[0]+R[7]*v[1]+R[8]*v[2]];
+const q2euler=q=>{const[w,x,y,z]=q,d=180/Math.PI;return{roll:Math.atan2(2*(w*x+y*z),1-2*(x*x+y*y))*d,pitch:Math.abs(2*(w*y-z*x))>=1?Math.sign(2*(w*y-z*x))*90:Math.asin(2*(w*y-z*x))*d,yaw:Math.atan2(2*(w*z+x*y),1-2*(y*y+z*z))*d}};
+const skew=v=>new Float64Array([0,-v[2],v[1],v[2],0,-v[0],-v[1],v[0],0]);
+
+// ═══ DNN ═══
+class DL{constructor(ni,no,act='relu'){this.ni=ni;this.no=no;this.act=act;const sc=act==='relu'?Math.sqrt(2/ni):Math.sqrt(1/ni);this.W=new Float64Array(no*ni);this.b=new Float64Array(no);for(let i=0;i<this.W.length;i++)this.W[i]=this._rn()*sc;this.mW=new Float64Array(no*ni);this.mb=new Float64Array(no)}
+_rn(){return Math.sqrt(-2*Math.log(Math.random()||1e-10))*Math.cos(2*Math.PI*Math.random())}
+fwd(x){this.xc=new Float64Array(x);const z=new Float64Array(this.no);for(let i=0;i<this.no;i++){let s=this.b[i];for(let j=0;j<this.ni;j++)s+=this.W[i*this.ni+j]*x[j];z[i]=s}this.zc=z;const a=new Float64Array(this.no);if(this.act==='relu')for(let i=0;i<this.no;i++)a[i]=z[i]>0?z[i]:0;else for(let i=0;i<this.no;i++)a[i]=z[i];return a}
+bwd(g,lr,mom){const dz=new Float64Array(this.no);if(this.act==='relu')for(let i=0;i<this.no;i++)dz[i]=this.zc[i]>0?g[i]:0;else for(let i=0;i<this.no;i++)dz[i]=g[i];const dx=new Float64Array(this.ni);for(let j=0;j<this.ni;j++){let s=0;for(let i=0;i<this.no;i++)s+=this.W[i*this.ni+j]*dz[i];dx[j]=s}let gn=0;for(let i=0;i<this.no;i++)gn+=dz[i]*dz[i];gn=Math.sqrt(gn);const sc=gn>5?5/gn:1;for(let i=0;i<this.no;i++){for(let j=0;j<this.ni;j++){const gg=dz[i]*this.xc[j]*sc;this.mW[i*this.ni+j]=mom*this.mW[i*this.ni+j]+lr*gg;this.W[i*this.ni+j]-=this.mW[i*this.ni+j]}this.mb[i]=mom*this.mb[i]+lr*dz[i]*sc;this.b[i]-=this.mb[i]}return dx}}
+class DNN{constructor(){this.L=[new DL(24,48,'relu'),new DL(48,32,'relu'),new DL(32,3,'linear')];this.lr=.001;this.mom=.9;this.tc=0;this.rl=0;this.lp=[0,0,0];this.conf=0}
+features(w){if(w.length<5)return null;const f=new Float64Array(24),chs=[];for(let c=0;c<3;c++){chs.push(w.map(s=>s.acc[c]));chs.push(w.map(s=>s.gyr[c]))}for(let c=0;c<6;c++){const ch=chs[c];let m=0;for(const v of ch)m+=v;m/=w.length;let vr=0;for(const v of ch)vr+=(v-m)**2;const sd=Math.sqrt(vr/w.length);let en=0;for(const v of ch)en+=v*v;en=Math.sqrt(en/w.length);let mn=Infinity,mx=-Infinity;for(const v of ch){if(v<mn)mn=v;if(v>mx)mx=v}f[c*4]=Math.tanh(m*.1);f[c*4+1]=Math.tanh(sd*.1);f[c*4+2]=Math.tanh(en*.1);f[c*4+3]=Math.tanh((mx-mn)*.1)}return f}
+predict(f){if(!f)return[0,0,0];let x=f;for(const l of this.L)x=l.fwd(x);this.lp=[x[0],x[1],x[2]];return this.lp}
+train(f,t){if(!f)return;const p=this.predict(f);const lv=[p[0]-t[0],p[1]-t[1],p[2]-t[2]];const loss=(lv[0]**2+lv[1]**2+lv[2]**2)/3;let g=new Float64Array([lv[0]*2/3,lv[1]*2/3,lv[2]*2/3]);for(let i=this.L.length-1;i>=0;i--)g=this.L[i].bwd(g,this.lr,this.mom);this.tc++;this.rl=this.rl*.95+loss*.05;this.conf=Math.max(0,Math.min(1,1-Math.sqrt(this.rl)*5))}
+adaptR(){const r=.1+9.9*(1-this.conf);return new Float64Array([r,0,0,0,r,0,0,0,r])}}
+
+// ═══ VIO ═══
+class VIO{
+constructor(video){this.video=video;this.W=120;this.H=90;this.cvs=document.createElement('canvas');this.cvs.width=this.W;this.cvs.height=this.H;this.ctx=this.cvs.getContext('2d',{willReadFrequently:true});this.prev=null;this.flow={u:0,v:0,count:0,conf:0};this.vel=[0,0,0];this.focal=this.W*.85;this.depthNom=1.5;this.ready=false;this.isStationary=false;this.transU=0;this.transV=0;this.displayCvs=document.getElementById('vioPreview');this.displayCtx=this.displayCvs.getContext('2d');this.flowCvs=document.getElementById('flowCanvas');this.flowCtx=this.flowCvs.getContext('2d')}
+async init(){try{const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:320},height:{ideal:240}},audio:false});this.video.srcObject=s;await new Promise(r=>this.video.onloadedmetadata=r);await this.video.play();this.ready=true;return true}catch(e){document.getElementById('vioInfo').innerText='Camera: '+e.message;return false}}
+capture(){if(!this.ready)return null;this.ctx.drawImage(this.video,0,0,this.W,this.H);const imd=this.ctx.getImageData(0,0,this.W,this.H);const g=new Float32Array(this.W*this.H);for(let i=0;i<g.length;i++){const j=i*4;g[i]=.299*imd.data[j]+.587*imd.data[j+1]+.114*imd.data[j+2]}this.displayCtx.drawImage(this.video,0,0,80,60);return g}
+computeFlow(){const cur=this.capture();if(!cur||!this.prev){this.prev=cur;return null}const step=10,halfW=3;let cnt=0;const us=[],vs=[],xs=[],ys=[];
+for(let y=halfW+1;y<this.H-halfW-1;y+=step){for(let x=halfW+1;x<this.W-halfW-1;x+=step){let A11=0,A12=0,A22=0,b1=0,b2=0;for(let wy=-halfW;wy<=halfW;wy++)for(let wx=-halfW;wx<=halfW;wx++){const idx=(y+wy)*this.W+(x+wx);const ix=(cur[idx+1]-cur[idx-1])*.5;const iy=(cur[idx+this.W]-cur[idx-this.W])*.5;const it=cur[idx]-this.prev[idx];A11+=ix*ix;A12+=ix*iy;A22+=iy*iy;b1-=ix*it;b2-=iy*it}const det=A11*A22-A12*A12;const minEig=.5*((A11+A22)-Math.sqrt((A11-A22)**2+4*A12*A12));if(det>50&&minEig>5){const u=(A22*b1-A12*b2)/det;const v=(-A12*b1+A11*b2)/det;if(Math.abs(u)<8&&Math.abs(v)<8){us.push(u);vs.push(v);xs.push(x);ys.push(y);cnt++}}}}
+this.prev=cur;let mU=0,mV=0;if(cnt>0){const sU=[...us].sort((a,b)=>a-b),sV=[...vs].sort((a,b)=>a-b);mU=sU[Math.floor(cnt/2)];mV=sV[Math.floor(cnt/2)]}
+this.flow={u:mU,v:mV,count:cnt,conf:Math.min(1,cnt/40)};
+this.flowCtx.clearRect(0,0,80,60);this.flowCtx.strokeStyle='#ff00ff';this.flowCtx.lineWidth=1;const sc=80/this.W;for(let i=0;i<xs.length;i++){const x=xs[i]*sc,y=ys[i]*sc;this.flowCtx.beginPath();this.flowCtx.moveTo(x,y);this.flowCtx.lineTo(x+us[i]*3*sc,y+vs[i]*3*sc);this.flowCtx.stroke()}
+return this.flow}
+process(gyro,R,dt){if(!this.flow)return null;const f=this.focal;const uRot=-gyro[1]*f*dt,vRot=gyro[0]*f*dt;this.transU=this.flow.u-uRot;this.transV=this.flow.v-vRot;const D=this.depthNom;const vxC=(this.transU/dt)*D/f,vyC=(this.transV/dt)*D/f;const vb=[vxC,-vyC,0];this.vel=Rv(R,vb);const tm=Math.sqrt(this.transU**2+this.transV**2);this.isStationary=(tm<.35)&&(this.flow.count>20);return this.vel}
+getR(){const b=.2,cf=1/(this.flow.conf+.1),r=b*cf;return new Float64Array([r,0,0,0,r,0,0,0,r*2])}}
+
+// ═══ ES-EKF ═══
+class ESEKF{constructor(){this.q=[1,0,0,0];this.p=[0,0,0];this.v=[0,0,0];this.bg=[0,0,0];this.ba=[0,0,0];this.P=eye(NS);for(let i=0;i<3;i++){this.P[i*NS+i]=.1;this.P[(3+i)*NS+(3+i)]=.01;this.P[(6+i)*NS+(6+i)]=.01;this.P[(9+i)*NS+(9+i)]=.001;this.P[(12+i)*NS+(12+i)]=.01}this.sg=.015;this.sa=.15;this.sbg=.0003;this.sba=.003;this.Rz=new Float64Array([.01,0,0,0,.01,0,0,0,.01]);this.aBuf=[];this.gBuf=[];this.bSz=25;this.isStat=false;this.g=[0,0,9.81];this.cN=0;this.cA=[0,0,0];this.cG=[0,0,0];this.cal=false;this.cT=80}
+calibrate(gy,ac){for(let i=0;i<3;i++){this.cG[i]+=gy[i];this.cA[i]+=ac[i]}this.cN++;if(this.cN>=this.cT){const n=this.cN;for(let i=0;i<3;i++)this.bg[i]=this.cG[i]/n;const ma=[this.cA[0]/n,this.cA[1]/n,this.cA[2]/n];const gn=Math.sqrt(ma[0]**2+ma[1]**2+ma[2]**2);this.g=[0,0,gn||9.81];const gb=[ma[0]/gn,ma[1]/gn,ma[2]/gn],dot=gb[2];if(dot>.999)this.q=[1,0,0,0];else if(dot<-.999)this.q=[0,1,0,0];else this.q=qnorm([1+dot,-gb[1],gb[0],0]);this.cal=true}return this.cal}
+detectStat(gy,ac){this.aBuf.push([ac[0],ac[1],ac[2]]);this.gBuf.push([gy[0],gy[1],gy[2]]);if(this.aBuf.length>this.bSz)this.aBuf.shift();if(this.gBuf.length>this.bSz)this.gBuf.shift();if(this.aBuf.length<this.bSz)return false;let mx=0,my=0,mz=0;for(const a of this.aBuf){mx+=a[0];my+=a[1];mz+=a[2]}mx/=this.bSz;my/=this.bSz;mz/=this.bSz;let vr=0;for(const a of this.aBuf)vr+=(a[0]-mx)**2+(a[1]-my)**2+(a[2]-mz)**2;vr/=this.bSz;const lg=this.gBuf[this.gBuf.length-1],gm=Math.sqrt(lg[0]**2+lg[1]**2+lg[2]**2);this.isStat=(vr<.3)&&(gm<.6);return this.isStat}
+predict(gy,ac,dt){const wc=[gy[0]-this.bg[0],gy[1]-this.bg[1],gy[2]-this.bg[2]];const ac2=[ac[0]-this.ba[0],ac[1]-this.ba[1],ac[2]-this.ba[2]];this.q=qnorm(qmul(this.q,qfromrv([wc[0]*dt,wc[1]*dt,wc[2]*dt])));const R=q2R(this.q),aw=Rv(R,ac2);aw[0]-=this.g[0];aw[1]-=this.g[1];aw[2]-=this.g[2];for(let i=0;i<3;i++){this.p[i]+=this.v[i]*dt+.5*aw[i]*dt*dt;this.v[i]+=aw[i]*dt}const Phi=eye(NS),sw=skew(wc),Rsa=mmul(R,skew(ac2),3,3,3);for(let i=0;i<3;i++)for(let j=0;j<3;j++){Phi[i*NS+j]+=-sw[i*3+j]*dt;Phi[i*NS+(9+j)]+=-(i===j?1:0)*dt;Phi[(3+i)*NS+(6+j)]+=(i===j?1:0)*dt;Phi[(6+i)*NS+j]+=-Rsa[i*3+j]*dt;Phi[(6+i)*NS+(12+j)]+=-R[i*3+j]*dt}const Q=mat(NS,NS);for(let i=0;i<3;i++){Q[i*NS+i]=this.sg**2*dt;Q[(6+i)*NS+(6+i)]=this.sa**2*dt;Q[(9+i)*NS+(9+i)]=this.sbg**2*dt;Q[(12+i)*NS+(12+i)]=this.sba**2*dt}const Pn=mmul(mmul(Phi,this.P,NS,NS,NS),mtrans(Phi,NS,NS),NS,NS,NS);for(let i=0;i<NS*NS;i++)Pn[i]+=Q[i];this.P=Pn;for(let i=0;i<NS;i++)for(let j=i+1;j<NS;j++){const a=.5*(this.P[i*NS+j]+this.P[j*NS+i]);this.P[i*NS+j]=a;this.P[j*NS+i]=a}}
+velUpdate(zv,Rm){const z=[zv[0]-this.v[0],zv[1]-this.v[1],zv[2]-this.v[2]];const S=new Float64Array(9);for(let i=0;i<3;i++)for(let j=0;j<3;j++)S[i*3+j]=this.P[(6+i)*NS+(6+j)]+Rm[i*3+j];const Si=inv3(S),PH=mat(NS,3);for(let i=0;i<NS;i++)for(let j=0;j<3;j++)PH[i*3+j]=this.P[i*NS+(6+j)];const K=mmul(PH,Si,NS,3,3),dx=new Float64Array(NS);for(let i=0;i<NS;i++)dx[i]=K[i*3]*z[0]+K[i*3+1]*z[1]+K[i*3+2]*z[2];const KH=mat(NS,NS);for(let i=0;i<NS;i++)for(let j=0;j<3;j++)KH[i*NS+(6+j)]=K[i*3+j];const IKH=eye(NS);for(let i=0;i<NS*NS;i++)IKH[i]-=KH[i];this.P=mmul(IKH,this.P,NS,NS,NS);this.q=qnorm(qmul(this.q,qfromrv([dx[0],dx[1],dx[2]])));for(let i=0;i<3;i++){this.p[i]+=dx[3+i];this.v[i]+=dx[6+i];this.bg[i]+=dx[9+i];this.ba[i]+=dx[12+i]}}
+zupt(){this.velUpdate([0,0,0],this.Rz)}}
+
+// ═══ CHART ═══
+class SC{constructor(id,cl,mx){this.cvs=document.getElementById(id);this.ctx=this.cvs.getContext('2d');this.cl=cl;this.mx=mx;this.sr=cl.map(()=>[]);this._rs();window.addEventListener('resize',()=>this._rs())}
+_rs(){const r=this.cvs.getBoundingClientRect(),d=window.devicePixelRatio||1;this.cvs.width=r.width*d;this.cvs.height=r.height*d;this.ctx.setTransform(d,0,0,d,0,0);this.w=r.width;this.h=r.height}
+push(v){for(let i=0;i<v.length;i++){this.sr[i].push(v[i]);if(this.sr[i].length>this.mx)this.sr[i].shift()}}
+draw(){const c=this.ctx,w=this.w,h=this.h;c.clearRect(0,0,w,h);let mn=Infinity,mx=-Infinity;for(const s of this.sr)for(const v of s){if(v<mn)mn=v;if(v>mx)mx=v}if(mn===mx){mn-=1;mx+=1}const p=(mx-mn)*.12||1;mn-=p;mx+=p;const zy=h-((0-mn)/(mx-mn))*h;c.strokeStyle='#444';c.lineWidth=.5;c.setLineDash([3,3]);c.beginPath();c.moveTo(0,zy);c.lineTo(w,zy);c.stroke();c.setLineDash([]);c.fillStyle='#555';c.font='9px monospace';c.fillText(mx.toFixed(1),2,10);c.fillText(mn.toFixed(1),2,h-3);const n=this.sr[0].length;if(n<2)return;const dx=w/(this.mx-1);for(let si=0;si<this.sr.length;si++){const s=this.sr[si];c.strokeStyle=this.cl[si];c.lineWidth=1.5;c.beginPath();for(let i=0;i<s.length;i++){const x=(this.mx-s.length+i)*dx,y=h-((s[i]-mn)/(mx-mn))*h;i===0?c.moveTo(x,y):c.lineTo(x,y)}c.stroke()}}}
+
+// ═══ APP ═══
+const statusEl=document.getElementById('status');
+const ekf=new ESEKF(),dnn=new DNN();
+const video=document.getElementById('cam');
+const vio=new VIO(video);
+let lastT=0,fc=0,sc=0;const MP=200;
+const HP=.8;let gE=null;const imuW=[];const WS=50;
+let latestGyro=[0,0,0];
+const pC=new SC('posChart',['#ff5555','#55ff55','#5555ff'],MP);
+const aC=new SC('angChart',['#ffcc00','#00cccc','#ff00ff'],MP);
+const vC=new SC('velChart',['#ff44cc','#00aaff'],MP);
+
+document.getElementById('start').onclick=async()=>{
+    try{if(typeof DeviceMotionEvent!=='undefined'&&typeof DeviceMotionEvent.requestPermission==='function')await DeviceMotionEvent.requestPermission()}catch(e){statusEl.innerText='Perm: '+e.message}
+    const ok=await vio.init();
+    const vm=document.getElementById('vioMode');
+    if(ok){vm.innerText='ACTIVE';vm.style.background='#4a1a4a';vm.style.color='#f4c';document.getElementById('vioInfo').innerText='Camera streaming'}
+    else{vm.innerText='NO CAM';vm.style.background='#3a0a0a';vm.style.color='#f55'}
+    document.getElementById('start').style.display='none';
+    statusEl.innerText='Calibrating — hold still...';
+    window.addEventListener('devicemotion',onM);
+    if(ok)setInterval(vioTick,66);
+};
+
+function gLA(ev){if(ev.acceleration&&ev.acceleration.x!=null)return[ev.acceleration.x,ev.acceleration.y,ev.acceleration.z];const ag=ev.accelerationIncludingGravity;if(!ag||ag.x==null)return null;if(!gE)gE={x:ag.x,y:ag.y,z:ag.z};gE.x=HP*gE.x+(1-HP)*ag.x;gE.y=HP*gE.y+(1-HP)*ag.y;gE.z=HP*gE.z+(1-HP)*ag.z;return[ag.x-gE.x,ag.y-gE.y,ag.z-gE.z]}
+
+let vlT=0;
+function vioTick(){
+    if(!ekf.cal)return;
+    const now=performance.now();if(vlT===0){vlT=now;return}
+    const dt=(now-vlT)/1000;vlT=now;if(dt>.5||dt<.001)return;
+    const fl=vio.computeFlow();if(!fl)return;
+    const gc=[latestGyro[0]-ekf.bg[0],latestGyro[1]-ekf.bg[1],latestGyro[2]-ekf.bg[2]];
+    const R=q2R(ekf.q);
+    const vv=vio.process(gc,R,dt);
+    if(vio.isStationary)ekf.velUpdate([0,0,0],new Float64Array([.005,0,0,0,.005,0,0,0,.005]));
+    else if(fl.count>15&&vv)ekf.velUpdate(vv,vio.getR());
+    document.getElementById('vioFlow').innerText=`Flow: ${fl.u.toFixed(1)}, ${fl.v.toFixed(1)} (T:${vio.transU.toFixed(1)},${vio.transV.toFixed(1)})`;
+    document.getElementById('vioVel').innerText=`Vel: ${(vv[0]*100).toFixed(1)}, ${(vv[1]*100).toFixed(1)}, ${(vv[2]*100).toFixed(1)} cm/s`;
+    document.getElementById('vioConf').innerText=`Tracks: ${fl.count} | ${vio.isStationary?'VIS-STAT':'VIS-MOVE'}`;
+}
+
+function onM(ev){
+    const now=performance.now();if(lastT===0){lastT=now;return}
+    const dt=(now-lastT)/1000;lastT=now;if(dt>.5||dt<.001)return;
+    const gr=ev.rotationRate,aIG=ev.accelerationIncludingGravity;
+    if(!gr||!aIG){statusEl.innerText='No sensor data';return}
+    if(gr.alpha==null||aIG.x==null){statusEl.innerText='Null values';return}
+    const gy=[gr.alpha*Math.PI/180,gr.beta*Math.PI/180,gr.gamma*Math.PI/180];
+    latestGyro=gy;
+    const aF=[aIG.x,aIG.y,aIG.z],lA=gLA(ev)||[0,0,0];sc++;
+    if(!ekf.cal){ekf.calibrate(gy,aF);statusEl.innerText=`Calibrating... ${Math.round(ekf.cN/ekf.cT*100)}%`;return}
+    imuW.push({acc:lA,gyr:gy});if(imuW.length>WS)imuW.shift();
+    ekf.detectStat(gy,lA);ekf.predict(gy,aF,dt);
+    if(ekf.isStat)ekf.zupt();
+    const feat=dnn.features(imuW);
+    const dm=document.getElementById('dnnMode');
+    if(ekf.isStat){dnn.train(feat,[0,0,0]);dm.innerText='TRAIN';dm.style.background='#1a3a1a';dm.style.color='#0f0'}
+    else if(dnn.tc>30){const dv=dnn.predict(feat);ekf.velUpdate(dv,dnn.adaptR());dm.innerText='INFER';dm.style.background='#1a1a3a';dm.style.color='#0af'}
+    else{dm.innerText='WARMUP';dm.style.background='#3a3a1a';dm.style.color='#fc0'}
+    const vM=Math.sqrt(ekf.v[0]**2+ekf.v[1]**2+ekf.v[2]**2);
+    if(vM<.02&&ekf.isStat){for(let i=0;i<3;i++)ekf.v[i]*=.5}
+    const e=q2euler(ekf.q),dp=dnn.lp,vv=vio.vel;
+    pC.push([ekf.p[0]*100,ekf.p[1]*100,ekf.p[2]*100]);
+    aC.push([e.pitch,e.roll,e.yaw]);
+    vC.push([vv[0]*100,dp[0]*100]);
+    fc++;if(fc%3===0){pC.draw();aC.draw();vC.draw()}
+    document.getElementById('posVal').innerText=`POS: ${(ekf.p[0]*100).toFixed(1)}, ${(ekf.p[1]*100).toFixed(1)}, ${(ekf.p[2]*100).toFixed(1)} cm`;
+    document.getElementById('angVal').innerText=`ANG: ${e.pitch.toFixed(0)}, ${e.roll.toFixed(0)}, ${e.yaw.toFixed(0)}°`;
+    document.getElementById('velVal').innerText=`VEL: ${(vM*100).toFixed(1)} cm/s`;
+    document.getElementById('dnnTrain').innerText=`Samples: ${dnn.tc}`;
+    document.getElementById('dnnLoss').innerText=`Loss: ${dnn.rl.toFixed(5)}`;
+    document.getElementById('dnnConf').innerText=`Conf: ${(dnn.conf*100).toFixed(0)}%`;
+    const srcs=[];if(ekf.isStat)srcs.push('IMU-Z');if(vio.isStationary)srcs.push('VIS-Z');if(dnn.tc>30&&!ekf.isStat)srcs.push('DNN');if(vio.flow&&vio.flow.count>15&&!vio.isStationary)srcs.push('VIO');
+    statusEl.innerText='▶ Fusion: '+(srcs.join(' + ')||'EKF-only');
+    statusEl.style.color=srcs.includes('IMU-Z')||srcs.includes('VIS-Z')?'#0f0':'#fc0';
+}
+</script>
+</body>
+</html>

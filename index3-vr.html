@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EKF + DNN + VIO</title>
+<style>
+body{font-family:'Courier New',monospace;background:#0a0a0a;color:#00ff41;padding:10px;margin:0}
+.ctr{border:1px solid #00ff41;padding:12px;border-radius:4px;box-shadow:0 0 15px rgba(0,255,65,.2)}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:10px}
+.st{background:#111;padding:7px;border:1px solid #222}
+.lb{font-size:.55rem;color:#008f11;display:block;margin-bottom:2px}
+.vl{font-size:1rem}
+button{width:100%;padding:13px;background:#00ff41;color:#000;border:none;font-weight:bold;cursor:pointer;margin-bottom:10px;font-size:12px}
+button:active{background:#008f11}
+#status{font-size:.65rem;color:#ffcc00;margin-bottom:6px;min-height:1em}
+.stit{font-size:.6rem;color:#008f11;margin-top:10px;margin-bottom:4px}
+.bg{display:grid;grid-template-columns:1fr 1fr 1fr;gap:3px}
+.bc{background:#0d0d0d;padding:4px;border:1px solid #1a1a1a;font-size:.6rem}
+.bl{font-size:.48rem;color:#005f11;display:block}
+.ebar{font-size:.55rem;color:#005f11;margin-top:8px;border-top:1px solid #1a1a1a;padding-top:6px}
+.box{background:#0d0d0d;border:1px solid;padding:7px;margin-top:8px;border-radius:3px}
+.box-title{font-size:.6rem;font-weight:bold;margin-bottom:5px}
+.dnn{border-color:#1a1a3a}.dnn .box-title{color:#00aaff}.dnn .stats{color:#0088cc}
+.vio{border-color:#3a1a3a}.vio .box-title{color:#ff44cc}.vio .stats{color:#cc3399}
+.stats{font-size:.58rem;line-height:1.5}
+.mode-tag{display:inline-block;padding:1px 5px;border-radius:3px;font-size:.52rem;font-weight:bold;margin-left:5px}
+#vioPanel{display:flex;gap:8px;align-items:center;margin-top:5px}
+#vioPreview{width:80px;height:60px;background:#000;border:1px solid #333;display:block}
+#flowCanvas{width:80px;height:60px;position:absolute;pointer-events:none}
+.vio-wrap{position:relative;width:80px;height:60px}
+.vio-info{flex:1;font-size:.55rem;color:#cc3399;line-height:1.4}
+</style>
+</head>
+<body>
+<div class="ctr">
+<h2 style="font-size:.95rem">EKF + DNN + VIO ENGINE</h2>
+<div style="font-size:.5rem;color:#005f11;margin-bottom:8px">15-STATE EKF · ONLINE NEURAL NET · VISUAL-INERTIAL ODOMETRY</div>
+<button id="start">INITIALIZE ALL SYSTEMS</button>
+<div id="status"></div>
+
+<div class="grid">
+<div class="st"><span class="lb">HEADING</span><div class="vl" id="yaw">0°</div></div>
+<div class="st"><span class="lb">ATTITUDE P/R</span><div class="vl" id="att">0,0°</div></div>
+<div class="st"><span class="lb">POS X,Y (CM)</span><div class="vl" id="posXY">0,0</div></div>
+<div class="st"><span class="lb">POS Z (CM)</span><div class="vl" id="posZ">0</div></div>
+<div class="st"><span class="lb">VEL (CM/S)</span><div class="vl" id="vel">0</div></div>
+<div class="st"><span class="lb">STATE</span><div class="vl" id="ekfState">INIT</div></div>
+</div>
+
+<div class="stit">BIASES</div>
+<div class="bg">
+<div class="bc"><span class="bl">GX</span><span id="bgx">0</span></div>
+<div class="bc"><span class="bl">GY</span><span id="bgy">0</span></div>
+<div class="bc"><span class="bl">GZ</span><span id="bgz">0</span></div>
+<div class="bc"><span class="bl">AX</span><span id="bax">0</span></div>
+<div class="bc"><span class="bl">AY</span><span id="bay">0</span></div>
+<div class="bc"><span class="bl">AZ</span><span id="baz">0</span></div>
+</div>
+
+<div class="box dnn">
+<div class="box-title">NEURAL NETWORK <span class="mode-tag" id="dnnMode" style="background:#333;color:#888">IDLE</span></div>
+<div class="stats">
+<div>MLP 24→48→32→3</div>
+<div id="dnnTrain">Samples: 0</div>
+<div id="dnnLoss">Loss: —</div>
+<div id="dnnConf">Conf: — | R: —</div>
+</div>
+</div>
+
+<div class="box vio">
+<div class="box-title">VISUAL-INERTIAL ODOMETRY <span class="mode-tag" id="vioMode" style="background:#333;color:#888">OFF</span></div>
+<div id="vioPanel">
+<div class="vio-wrap">
+<canvas id="vioPreview" width="80" height="60"></canvas>
+<canvas id="flowCanvas" width="80" height="60"></canvas>
+</div>
+<div class="vio-info">
+<div id="vioFlow">Flow: 0, 0 px</div>
+<div id="vioVel">Vel (cam): 0, 0 cm/s</div>
+<div id="vioConf">Tracks: 0 | Conf: —</div>
+<div id="vioInfo" style="font-size:.5rem;color:#663366">req. HTTPS/localhost</div>
+</div>
+</div>
+</div>
+
+<div class="ebar" id="ekfBar">dt: — | samples: 0</div>
+</div>
+
+<video id="cam" playsinline autoplay style="display:none"></video>
+
+<script>
+"use strict";
+
+// ═══ MATRIX ═══
+const NS=15;
+const mat=(r,c)=>new Float64Array(r*c);
+const eye=n=>{const m=mat(n,n);for(let i=0;i<n;i++)m[i*n+i]=1;return m};
+function mmul(A,B,ra,ca,cb){const C=mat(ra,cb);for(let i=0;i<ra;i++)for(let j=0;j<cb;j++){let s=0;for(let k=0;k<ca;k++)s+=A[i*ca+k]*B[k*cb+j];C[i*cb+j]=s}return C}
+function mtrans(A,r,c){const T=mat(c,r);for(let i=0;i<r;i++)for(let j=0;j<c;j++)T[j*r+i]=A[i*c+j];return T}
+function inv3(M){const[a,b,c,d,e,f,g,h,k]=M;const A=e*k-f*h,B=-(d*k-f*g),C=d*h-e*g,D=-(b*k-c*h),E=a*k-c*g,F=-(a*h-b*g),G=b*f-c*e,H=-(a*f-c*d),K=a*e-b*d;const det=a*A+b*B+c*C;if(Math.abs(det)<1e-15)return eye(3);const id=1/det;return new Float64Array([A*id,D*id,G*id,B*id,E*id,H*id,C*id,F*id,K*id])}
+
+// ═══ QUATERNION ═══
+const qmul=(a,b)=>[a[0]*b[0]-a[1]*b[1]-a[2]*b[2]-a[3]*b[3],a[0]*b[1]+a[1]*b[0]+a[2]*b[3]-a[3]*b[2],a[0]*b[2]-a[1]*b[3]+a[2]*b[0]+a[3]*b[1],a[0]*b[3]+a[1]*b[2]-a[2]*b[1]+a[3]*b[0]];
+const qnorm=q=>{const n=Math.sqrt(q[0]**2+q[1]**2+q[2]**2+q[3]**2)||1;return[q[0]/n,q[1]/n,q[2]/n,q[3]/n]};
+const qfromrv=r=>{const a=Math.sqrt(r[0]**2+r[1]**2+r[2]**2);if(a<1e-10)return[1,r[0]*.5,r[1]*.5,r[2]*.5];const h=a*.5,s=Math.sin(h)/a;return[Math.cos(h),r[0]*s,r[1]*s,r[2]*s]};
+const q2R=q=>{const[w,x,y,z]=q;return new Float64Array([1-2*(y*y+z*z),2*(x*y-w*z),2*(x*z+w*y),2*(x*y+w*z),1-2*(x*x+z*z),2*(y*z-w*x),2*(x*z-w*y),2*(y*z+w*x),1-2*(x*x+y*y)])};
+const Rv=(R,v)=>[R[0]*v[0]+R[1]*v[1]+R[2]*v[2],R[3]*v[0]+R[4]*v[1]+R[5]*v[2],R[6]*v[0]+R[7]*v[1]+R[8]*v[2]];
+const q2euler=q=>{const[w,x,y,z]=q,d=180/Math.PI;return{roll:Math.atan2(2*(w*x+y*z),1-2*(x*x+y*y))*d,pitch:Math.abs(2*(w*y-z*x))>=1?Math.sign(2*(w*y-z*x))*90:Math.asin(2*(w*y-z*x))*d,yaw:Math.atan2(2*(w*z+x*y),1-2*(y*y+z*z))*d}};
+const skew=v=>new Float64Array([0,-v[2],v[1],v[2],0,-v[0],-v[1],v[0],0]);
+
+// ═══ DNN ═══
+class DL{
+    constructor(ni,no,act='relu'){this.ni=ni;this.no=no;this.act=act;const sc=act==='relu'?Math.sqrt(2/ni):Math.sqrt(1/ni);this.W=new Float64Array(no*ni);this.b=new Float64Array(no);for(let i=0;i<this.W.length;i++)this.W[i]=this._rn()*sc;this.mW=new Float64Array(no*ni);this.mb=new Float64Array(no)}
+    _rn(){return Math.sqrt(-2*Math.log(Math.random()||1e-10))*Math.cos(2*Math.PI*Math.random())}
+    fwd(x){this.xc=new Float64Array(x);const z=new Float64Array(this.no);for(let i=0;i<this.no;i++){let s=this.b[i];for(let j=0;j<this.ni;j++)s+=this.W[i*this.ni+j]*x[j];z[i]=s}this.zc=z;const a=new Float64Array(this.no);if(this.act==='relu')for(let i=0;i<this.no;i++)a[i]=z[i]>0?z[i]:0;else for(let i=0;i<this.no;i++)a[i]=z[i];return a}
+    bwd(g,lr,mom){const dz=new Float64Array(this.no);if(this.act==='relu')for(let i=0;i<this.no;i++)dz[i]=this.zc[i]>0?g[i]:0;else for(let i=0;i<this.no;i++)dz[i]=g[i];const dx=new Float64Array(this.ni);for(let j=0;j<this.ni;j++){let s=0;for(let i=0;i<this.no;i++)s+=this.W[i*this.ni+j]*dz[i];dx[j]=s}let gn=0;for(let i=0;i<this.no;i++)gn+=dz[i]*dz[i];gn=Math.sqrt(gn);const sc=gn>5?5/gn:1;for(let i=0;i<this.no;i++){for(let j=0;j<this.ni;j++){const gg=dz[i]*this.xc[j]*sc;this.mW[i*this.ni+j]=mom*this.mW[i*this.ni+j]+lr*gg;this.W[i*this.ni+j]-=this.mW[i*this.ni+j]}this.mb[i]=mom*this.mb[i]+lr*dz[i]*sc;this.b[i]-=this.mb[i]}return dx}
+}
+class DNN{
+    constructor(){this.L=[new DL(24,48,'relu'),new DL(48,32,'relu'),new DL(32,3,'linear')];this.lr=.001;this.mom=.9;this.tc=0;this.rl=0;this.lp=[0,0,0];this.conf=0}
+    features(w){if(w.length<5)return null;const f=new Float64Array(24),chs=[];for(let c=0;c<3;c++){chs.push(w.map(s=>s.acc[c]));chs.push(w.map(s=>s.gyr[c]))}for(let c=0;c<6;c++){const ch=chs[c];let m=0;for(const v of ch)m+=v;m/=w.length;let vr=0;for(const v of ch)vr+=(v-m)**2;const sd=Math.sqrt(vr/w.length);let en=0;for(const v of ch)en+=v*v;en=Math.sqrt(en/w.length);let mn=Infinity,mx=-Infinity;for(const v of ch){if(v<mn)mn=v;if(v>mx)mx=v}f[c*4]=Math.tanh(m*.1);f[c*4+1]=Math.tanh(sd*.1);f[c*4+2]=Math.tanh(en*.1);f[c*4+3]=Math.tanh((mx-mn)*.1)}return f}
+    predict(f){if(!f)return[0,0,0];let x=f;for(const l of this.L)x=l.fwd(x);this.lp=[x[0],x[1],x[2]];return this.lp}
+    train(f,t){if(!f)return;const p=this.predict(f);const lv=[p[0]-t[0],p[1]-t[1],p[2]-t[2]];const loss=(lv[0]**2+lv[1]**2+lv[2]**2)/3;let g=new Float64Array([lv[0]*2/3,lv[1]*2/3,lv[2]*2/3]);for(let i=this.L.length-1;i>=0;i--)g=this.L[i].bwd(g,this.lr,this.mom);this.tc++;this.rl=this.rl*.95+loss*.05;this.conf=Math.max(0,Math.min(1,1-Math.sqrt(this.rl)*5))}
+    adaptR(){const r=.1+9.9*(1-this.conf);return new Float64Array([r,0,0,0,r,0,0,0,r])}
+}
+
+// ═══ VISUAL-INERTIAL ODOMETRY (Lucas-Kanade optical flow) ═══
+class VIO{
+    constructor(video){
+        this.video=video;
+        this.W=120;this.H=90;                    // Low-res for speed
+        this.cvs=document.createElement('canvas');
+        this.cvs.width=this.W;this.cvs.height=this.H;
+        this.ctx=this.cvs.getContext('2d',{willReadFrequently:true});
+        this.prev=null;                          // Float32Array of previous grayscale frame
+        this.flow={u:0,v:0,count:0,conf:0};      // Image-plane flow (px/frame)
+        this.vel=[0,0,0];                        // World-frame velocity estimate (m/s)
+        this.focal=this.W*.85;                   // Approx focal length in pixels (~60° HFOV)
+        this.depthNom=1.5;                       // Nominal scene depth (m)
+        this.ready=false;
+        this.isStationary=false;
+        this.transU=0;this.transV=0;             // Translation flow (rotation-compensated)
+        this.displayCvs=document.getElementById('vioPreview');
+        this.displayCtx=this.displayCvs.getContext('2d');
+        this.flowCvs=document.getElementById('flowCanvas');
+        this.flowCtx=this.flowCvs.getContext('2d');
+    }
+    
+    async init(){
+        try{
+            const stream=await navigator.mediaDevices.getUserMedia({
+                video:{facingMode:'environment',width:{ideal:320},height:{ideal:240}},
+                audio:false
+            });
+            this.video.srcObject=stream;
+            await new Promise(r=>this.video.onloadedmetadata=r);
+            await this.video.play();
+            this.ready=true;
+            return true;
+        }catch(e){
+            document.getElementById('vioInfo').innerText='Camera error: '+e.message;
+            return false;
+        }
+    }
+
+    capture(){
+        if(!this.ready) return null;
+        this.ctx.drawImage(this.video,0,0,this.W,this.H);
+        const imd=this.ctx.getImageData(0,0,this.W,this.H);
+        const g=new Float32Array(this.W*this.H);
+        for(let i=0;i<g.length;i++){
+            const j=i*4;
+            g[i]=.299*imd.data[j]+.587*imd.data[j+1]+.114*imd.data[j+2];
+        }
+        // Update small preview
+        this.displayCtx.drawImage(this.video,0,0,80,60);
+        return g;
+    }
+
+    // Lucas-Kanade optical flow on a sparse grid
+    // Returns image-plane translation (u,v) in pixels per frame
+    computeFlow(){
+        const cur=this.capture();
+        if(!cur||!this.prev){this.prev=cur;return null}
+        const step=10, halfW=3;                  // Grid step & window half-size (7x7 window)
+        let sumU=0,sumV=0,cnt=0;
+        const us=[],vs=[],xs=[],ys=[];
+        
+        for(let y=halfW+1;y<this.H-halfW-1;y+=step){
+            for(let x=halfW+1;x<this.W-halfW-1;x+=step){
+                let A11=0,A12=0,A22=0,b1=0,b2=0;
+                for(let wy=-halfW;wy<=halfW;wy++){
+                    for(let wx=-halfW;wx<=halfW;wx++){
+                        const idx=(y+wy)*this.W+(x+wx);
+                        const ix=(cur[idx+1]-cur[idx-1])*.5;
+                        const iy=(cur[idx+this.W]-cur[idx-this.W])*.5;
+                        const it=cur[idx]-this.prev[idx];
+                        A11+=ix*ix; A12+=ix*iy; A22+=iy*iy;
+                        b1-=ix*it;  b2-=iy*it;
+                    }
+                }
+                const det=A11*A22-A12*A12;
+                const minEig=.5*((A11+A22)-Math.sqrt((A11-A22)**2+4*A12*A12));
+                // Shi-Tomasi corner criterion: both eigenvalues large
+                if(det>50 && minEig>5){
+                    const u=(A22*b1-A12*b2)/det;
+                    const v=(-A12*b1+A11*b2)/det;
+                    if(Math.abs(u)<8 && Math.abs(v)<8){
+                        us.push(u); vs.push(v); xs.push(x); ys.push(y);
+                        sumU+=u; sumV+=v; cnt++;
+                    }
+                }
+            }
+        }
+        this.prev=cur;
+
+        // Median filter to reject outliers (more robust than mean)
+        let mU=0,mV=0;
+        if(cnt>0){
+            const sortedU=[...us].sort((a,b)=>a-b);
+            const sortedV=[...vs].sort((a,b)=>a-b);
+            mU=sortedU[Math.floor(cnt/2)];
+            mV=sortedV[Math.floor(cnt/2)];
+        }
+        this.flow={u:mU,v:mV,count:cnt,conf:Math.min(1,cnt/40)};
+
+        // Draw flow vectors on overlay
+        this.flowCtx.clearRect(0,0,80,60);
+        this.flowCtx.strokeStyle='#ff00ff';
+        this.flowCtx.lineWidth=1;
+        const scale=80/this.W;
+        for(let i=0;i<xs.length;i++){
+            const x=xs[i]*scale, y=ys[i]*scale;
+            this.flowCtx.beginPath();
+            this.flowCtx.moveTo(x,y);
+            this.flowCtx.lineTo(x+us[i]*3*scale,y+vs[i]*3*scale);
+            this.flowCtx.stroke();
+        }
+        return this.flow;
+    }
+
+    // Rotation-compensate optical flow using IMU gyro, convert to world velocity
+    // Model: observed_flow = rotation_flow + translation_flow
+    //   rotation_flow(x,y) ≈ -ω_y*f + ω_z*y  (near center, camera frame)
+    //                         ω_x*f - ω_z*x
+    // translation_flow → v_world via depth & focal length
+    process(gyro_body, R_body_to_world, dt){
+        if(!this.flow) return null;
+        const f=this.focal;
+        // Gyro in camera frame: assume camera frame ≈ body frame (phone held normally)
+        // Rotation-induced flow at image center (x=0,y=0):
+        //   u_rot ≈ -ω_y * f * dt
+        //   v_rot ≈ +ω_x * f * dt
+        const uRot = -gyro_body[1]*f*dt;
+        const vRot = +gyro_body[0]*f*dt;
+        // Translation-only flow (pixels per frame)
+        this.transU = this.flow.u - uRot;
+        this.transV = this.flow.v - vRot;
+        // Convert to pixels/second, then to m/s using nominal depth
+        // vx_cam = transU_per_sec * D / f
+        const D=this.depthNom;
+        const vx_cam = (this.transU/dt) * D / f;
+        const vy_cam = (this.transV/dt) * D / f;
+        // Camera→body: x_body = x_cam, y_body = -y_cam (image y points down)
+        const v_body = [vx_cam, -vy_cam, 0];
+        // Body→world rotation
+        const v_world = Rv(R_body_to_world, v_body);
+        this.vel = v_world;
+        // Visual stationary: translation flow near zero AND enough tracks
+        const transMag = Math.sqrt(this.transU**2+this.transV**2);
+        this.isStationary = (transMag < 0.35) && (this.flow.count > 20);
+        return v_world;
+    }
+
+    // Adaptive measurement noise for EKF
+    // Depends on tracking quality and depth uncertainty
+    getR(){
+        const baseR = 0.2;                       // m/s std (high because depth is unknown)
+        const confFactor = 1 / (this.flow.conf + 0.1);
+        const r = baseR * confFactor;
+        return new Float64Array([r,0,0, 0,r,0, 0,0,r*2]);  // Higher Z uncertainty
+    }
+}
+
+// ═══ ES-EKF ═══
+class ESEKF{
+    constructor(){
+        this.q=[1,0,0,0];this.p=[0,0,0];this.v=[0,0,0];this.bg=[0,0,0];this.ba=[0,0,0];
+        this.P=eye(NS);for(let i=0;i<3;i++){this.P[i*NS+i]=.1;this.P[(3+i)*NS+(3+i)]=.01;this.P[(6+i)*NS+(6+i)]=.01;this.P[(9+i)*NS+(9+i)]=.001;this.P[(12+i)*NS+(12+i)]=.01}
+        this.sg=.015;this.sa=.15;this.sbg=.0003;this.sba=.003;
+        this.Rz=new Float64Array([.01,0,0,0,.01,0,0,0,.01]);
+        this.aBuf=[];this.gBuf=[];this.bSz=25;this.isStat=false;
+        this.g=[0,0,9.81];this.cN=0;this.cA=[0,0,0];this.cG=[0,0,0];this.cal=false;this.cT=80;
+    }
+    calibrate(gy,ac){
+        for(let i=0;i<3;i++){this.cG[i]+=gy[i];this.cA[i]+=ac[i]}this.cN++;
+        if(this.cN>=this.cT){
+            const n=this.cN;for(let i=0;i<3;i++)this.bg[i]=this.cG[i]/n;
+            const ma=[this.cA[0]/n,this.cA[1]/n,this.cA[2]/n];
+            const gn=Math.sqrt(ma[0]**2+ma[1]**2+ma[2]**2);this.g=[0,0,gn||9.81];
+            const gb=[ma[0]/gn,ma[1]/gn,ma[2]/gn],dot=gb[2];
+            if(dot>.999)this.q=[1,0,0,0];else if(dot<-.999)this.q=[0,1,0,0];
+            else this.q=qnorm([1+dot,-gb[1],gb[0],0]);this.cal=true;
+        }
+        return this.cal;
+    }
+    detectStat(gy,ac){
+        this.aBuf.push([ac[0],ac[1],ac[2]]);this.gBuf.push([gy[0],gy[1],gy[2]]);
+        if(this.aBuf.length>this.bSz)this.aBuf.shift();if(this.gBuf.length>this.bSz)this.gBuf.shift();
+        if(this.aBuf.length<this.bSz)return false;
+        let mx=0,my=0,mz=0;for(const a of this.aBuf){mx+=a[0];my+=a[1];mz+=a[2]}
+        mx/=this.bSz;my/=this.bSz;mz/=this.bSz;
+        let vr=0;for(const a of this.aBuf)vr+=(a[0]-mx)**2+(a[1]-my)**2+(a[2]-mz)**2;vr/=this.bSz;
+        const lg=this.gBuf[this.gBuf.length-1],gm=Math.sqrt(lg[0]**2+lg[1]**2+lg[2]**2);
+        this.isStat=(vr<.3)&&(gm<.6);return this.isStat;
+    }
+    predict(gy,ac,dt){
+        const wc=[gy[0]-this.bg[0],gy[1]-this.bg[1],gy[2]-this.bg[2]];
+        const ac2=[ac[0]-this.ba[0],ac[1]-this.ba[1],ac[2]-this.ba[2]];
+        this.q=qnorm(qmul(this.q,qfromrv([wc[0]*dt,wc[1]*dt,wc[2]*dt])));
+        const R=q2R(this.q),aw=Rv(R,ac2);aw[0]-=this.g[0];aw[1]-=this.g[1];aw[2]-=this.g[2];
+        for(let i=0;i<3;i++){this.p[i]+=this.v[i]*dt+.5*aw[i]*dt*dt;this.v[i]+=aw[i]*dt}
+        const Phi=eye(NS),sw=skew(wc),Rsa=mmul(R,skew(ac2),3,3,3);
+        for(let i=0;i<3;i++)for(let j=0;j<3;j++){
+            Phi[i*NS+j]+=-sw[i*3+j]*dt;Phi[i*NS+(9+j)]+=-(i===j?1:0)*dt;
+            Phi[(3+i)*NS+(6+j)]+=(i===j?1:0)*dt;Phi[(6+i)*NS+j]+=-Rsa[i*3+j]*dt;Phi[(6+i)*NS+(12+j)]+=-R[i*3+j]*dt;
+        }
+        const Q=mat(NS,NS);
+        for(let i=0;i<3;i++){Q[i*NS+i]=this.sg**2*dt;Q[(6+i)*NS+(6+i)]=this.sa**2*dt;Q[(9+i)*NS+(9+i)]=this.sbg**2*dt;Q[(12+i)*NS+(12+i)]=this.sba**2*dt}
+        const Pn=mmul(mmul(Phi,this.P,NS,NS,NS),mtrans(Phi,NS,NS),NS,NS,NS);
+        for(let i=0;i<NS*NS;i++)Pn[i]+=Q[i];this.P=Pn;
+        for(let i=0;i<NS;i++)for(let j=i+1;j<NS;j++){const a=.5*(this.P[i*NS+j]+this.P[j*NS+i]);this.P[i*NS+j]=a;this.P[j*NS+i]=a}
+    }
+    velUpdate(zv,Rm){
+        const z=[zv[0]-this.v[0],zv[1]-this.v[1],zv[2]-this.v[2]];
+        const S=new Float64Array(9);for(let i=0;i<3;i++)for(let j=0;j<3;j++)S[i*3+j]=this.P[(6+i)*NS+(6+j)]+Rm[i*3+j];
+        const Si=inv3(S),PH=mat(NS,3);
+        for(let i=0;i<NS;i++)for(let j=0;j<3;j++)PH[i*3+j]=this.P[i*NS+(6+j)];
+        const K=mmul(PH,Si,NS,3,3),dx=new Float64Array(NS);
+        for(let i=0;i<NS;i++)dx[i]=K[i*3]*z[0]+K[i*3+1]*z[1]+K[i*3+2]*z[2];
+        const KH=mat(NS,NS);for(let i=0;i<NS;i++)for(let j=0;j<3;j++)KH[i*NS+(6+j)]=K[i*3+j];
+        const IKH=eye(NS);for(let i=0;i<NS*NS;i++)IKH[i]-=KH[i];this.P=mmul(IKH,this.P,NS,NS,NS);
+        this.q=qnorm(qmul(this.q,qfromrv([dx[0],dx[1],dx[2]])));
+        for(let i=0;i<3;i++){this.p[i]+=dx[3+i];this.v[i]+=dx[6+i];this.bg[i]+=dx[9+i];this.ba[i]+=dx[12+i]}
+    }
+    zupt(){this.velUpdate([0,0,0],this.Rz)}
+}
+
+// ═══ APPLICATION ═══
+const statusEl=document.getElementById('status');
+const ekf=new ESEKF(), dnn=new DNN();
+const video=document.getElementById('cam');
+const vio=new VIO(video);
+
+let lastT=0, sc=0;
+const HP=.8; let gE=null;
+const imuW=[]; const WS=50;
+let latestGyro=[0,0,0];
+
+document.getElementById('start').onclick=async()=>{
+    try{if(typeof DeviceMotionEvent!=='undefined'&&typeof DeviceMotionEvent.requestPermission==='function')await DeviceMotionEvent.requestPermission()}catch(e){statusEl.innerText='Permission: '+e.message}
+    const vioOk = await vio.init();
+    const vm=document.getElementById('vioMode');
+    if(vioOk){vm.innerText='ACTIVE';vm.style.background='#3a1a3a';vm.style.color='#ff44cc';document.getElementById('vioInfo').innerText='Camera streaming'}
+    else{vm.innerText='UNAVAILABLE';vm.style.background='#3a0a0a';vm.style.color='#ff5555'}
+    document.getElementById('start').style.display='none';
+    statusEl.innerText='Calibrating IMU — hold still...';
+    window.addEventListener('devicemotion',onM);
+    // Run VIO on its own tick (independent of IMU rate)
+    if(vioOk) setInterval(vioTick, 66); // ~15 fps
+};
+
+function gLA(ev){
+    if(ev.acceleration&&ev.acceleration.x!=null)return[ev.acceleration.x,ev.acceleration.y,ev.acceleration.z];
+    const ag=ev.accelerationIncludingGravity;if(!ag||ag.x==null)return null;
+    if(!gE)gE={x:ag.x,y:ag.y,z:ag.z};
+    gE.x=HP*gE.x+(1-HP)*ag.x;gE.y=HP*gE.y+(1-HP)*ag.y;gE.z=HP*gE.z+(1-HP)*ag.z;
+    return[ag.x-gE.x,ag.y-gE.y,ag.z-gE.z];
+}
+
+let vioLastT=0;
+function vioTick(){
+    if(!ekf.cal)return;
+    const now=performance.now();
+    if(vioLastT===0){vioLastT=now;return}
+    const dt=(now-vioLastT)/1000;vioLastT=now;
+    if(dt>.5||dt<.001)return;
+
+    const flow = vio.computeFlow();
+    if(!flow) return;
+    
+    // Rotation-compensate using current gyro estimate (bias-corrected)
+    const gyroCorr = [latestGyro[0]-ekf.bg[0], latestGyro[1]-ekf.bg[1], latestGyro[2]-ekf.bg[2]];
+    const R = q2R(ekf.q);
+    const v_vio = vio.process(gyroCorr, R, dt);
+
+    // VIO Updates to EKF
+    if(vio.isStationary){
+        // Visual ZUPT — stronger than IMU ZUPT alone
+        ekf.velUpdate([0,0,0], new Float64Array([.005,0,0, 0,.005,0, 0,0,.005]));
+    } else if(vio.flow.count > 15 && v_vio){
+        // Use VIO velocity as EKF measurement
+        ekf.velUpdate(v_vio, vio.getR());
+    }
+    
+    // UI
+    document.getElementById('vioFlow').innerText=`Flow: ${flow.u.toFixed(1)}, ${flow.v.toFixed(1)} px (T:${vio.transU.toFixed(1)},${vio.transV.toFixed(1)})`;
+    document.getElementById('vioVel').innerText=`Vel: ${(v_vio[0]*100).toFixed(1)}, ${(v_vio[1]*100).toFixed(1)}, ${(v_vio[2]*100).toFixed(1)} cm/s`;
+    document.getElementById('vioConf').innerText=`Tracks: ${flow.count} | Conf: ${(flow.conf*100).toFixed(0)}% | ${vio.isStationary?'VIS-STAT':'VIS-MOVE'}`;
+}
+
+function onM(ev){
+    const now=performance.now();if(lastT===0){lastT=now;return}
+    const dt=(now-lastT)/1000;lastT=now;if(dt>.5||dt<.001)return;
+    const gr=ev.rotationRate,aIG=ev.accelerationIncludingGravity;
+    if(!gr||!aIG){statusEl.innerText='No sensor data';return}
+    if(gr.alpha==null||aIG.x==null){statusEl.innerText='Null values';return}
+
+    const gy=[gr.alpha*Math.PI/180,gr.beta*Math.PI/180,gr.gamma*Math.PI/180];
+    latestGyro = gy;
+    const aF=[aIG.x,aIG.y,aIG.z],lA=gLA(ev)||[0,0,0];sc++;
+
+    if(!ekf.cal){ekf.calibrate(gy,aF);statusEl.innerText=`Calibrating... ${Math.round(ekf.cN/ekf.cT*100)}%`;return}
+
+    imuW.push({acc:lA,gyr:gy});if(imuW.length>WS)imuW.shift();
+    ekf.detectStat(gy,lA);
+    ekf.predict(gy,aF,dt);
+    if(ekf.isStat) ekf.zupt();
+
+    // DNN
+    const feat=dnn.features(imuW);
+    const dm=document.getElementById('dnnMode');
+    if(ekf.isStat){dnn.train(feat,[0,0,0]);dm.innerText='TRAIN';dm.style.background='#1a3a1a';dm.style.color='#0f0'}
+    else if(dnn.tc>30){const dv=dnn.predict(feat);ekf.velUpdate(dv,dnn.adaptR());dm.innerText='INFER';dm.style.background='#1a1a3a';dm.style.color='#0af'}
+    else{dm.innerText='WARMUP';dm.style.background='#3a3a1a';dm.style.color='#fc0'}
+
+    const vM=Math.sqrt(ekf.v[0]**2+ekf.v[1]**2+ekf.v[2]**2);
+    if(vM<.02&&ekf.isStat){for(let i=0;i<3;i++)ekf.v[i]*=.5}
+
+    const e=q2euler(ekf.q),d2r=180/Math.PI;
+    document.getElementById('yaw').innerText=e.yaw.toFixed(0)+'°';
+    document.getElementById('att').innerText=`${e.pitch.toFixed(0)},${e.roll.toFixed(0)}°`;
+    document.getElementById('posXY').innerText=`${(ekf.p[0]*100).toFixed(1)},${(ekf.p[1]*100).toFixed(1)}`;
+    document.getElementById('posZ').innerText=(ekf.p[2]*100).toFixed(1);
+    document.getElementById('vel').innerText=(vM*100).toFixed(1);
+    document.getElementById('bgx').innerText=(ekf.bg[0]*d2r).toFixed(2);
+    document.getElementById('bgy').innerText=(ekf.bg[1]*d2r).toFixed(2);
+    document.getElementById('bgz').innerText=(ekf.bg[2]*d2r).toFixed(2);
+    document.getElementById('bax').innerText=(ekf.ba[0]*100).toFixed(1);
+    document.getElementById('bay').innerText=(ekf.ba[1]*100).toFixed(1);
+    document.getElementById('baz').innerText=(ekf.ba[2]*100).toFixed(1);
+
+    const srcs=[];if(ekf.isStat)srcs.push('IMU-ZUPT');if(vio.isStationary)srcs.push('VIS-ZUPT');if(dnn.tc>30&&!ekf.isStat)srcs.push('DNN');if(vio.flow&&vio.flow.count>15&&!vio.isStationary)srcs.push('VIO');
+    document.getElementById('ekfState').innerText=srcs.length?srcs[0]:'EKF';
+    statusEl.innerText = '▶ '+(srcs.length?srcs.join(' + '):'EKF-ONLY');
+    statusEl.style.color=ekf.isStat||vio.isStationary?'#0f0':'#fc0';
+    document.getElementById('ekfBar').innerText=`dt:${(dt*1000).toFixed(0)}ms · n:${sc} · fusion: ${srcs.join('+')||'none'}`;
+
+    dnn.lp; // touch to avoid unused warning
+    document.getElementById('dnnTrain').innerText=`Samples: ${dnn.tc}`;
+    document.getElementById('dnnLoss').innerText=`Loss: ${dnn.rl.toFixed(5)}`;
+    document.getElementById('dnnConf').innerText=`Conf: ${(dnn.conf*100).toFixed(0)}% | R:${dnn.adaptR()[0].toFixed(2)}`;
+}
+</script>
+</body>
+</html>
