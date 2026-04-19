@@ -4,20 +4,20 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>IMU 6-DOF Real-time Telemetry</title>
-    <script src="https://cdn.jsdelivr.net/npm/ahrs@1.1.1/index.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/gl-matrix/2.8.1/gl-matrix-min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body { font-family: sans-serif; background: #121212; color: #fff; margin: 0; padding: 10px; }
         .chart-container { position: relative; height: 30vh; width: 95vw; margin-bottom: 20px; background: #1e1e1e; border-radius: 8px; padding: 10px; }
         button { width: 100%; padding: 15px; background: #007bff; color: white; border: none; border-radius: 8px; font-weight: bold; margin-bottom: 10px; }
         .stats { display: flex; justify-content: space-around; font-family: monospace; font-size: 0.8rem; color: #00ff00; margin-bottom: 10px; }
+        #status { font-size: 0.75rem; color: #ff5555; margin-bottom: 10px; font-family: monospace; }
     </style>
 </head>
 <body>
 
     <button id="start">START TELEMETRY</button>
-    
+    <div id="status"></div>
+
     <div class="stats">
         <div id="posVal">POS: 0, 0, 0</div>
         <div id="angVal">ANG: 0, 0, 0</div>
@@ -32,90 +32,211 @@
     </div>
 
     <script>
-        const { vec3 } = glMatrix;
-        const madgwick = new AHRS({ sampleInterval: 20, algorithm: 'Madgwick', beta: 0.4 });
-        
-        let position = vec3.fromValues(0, 0, 0);
-        let velocity = vec3.fromValues(0, 0, 0);
-        let lastT = 0;
-        const MAX_POINTS = 100;
+    // ── Inline vec3 helpers ──────────────────────────────────────
+    const V3 = {
+        create: () => [0, 0, 0],
+        from: (x, y, z) => [x, y, z],
+        len: (v) => Math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]),
+        scale: (out, v, s) => { out[0]=v[0]*s; out[1]=v[1]*s; out[2]=v[2]*s; return out; },
+        add: (out, a, b) => { out[0]=a[0]+b[0]; out[1]=a[1]+b[1]; out[2]=a[2]+b[2]; return out; },
+        transformQuat: (out, v, q) => {
+            const x=v[0], y=v[1], z=v[2];
+            const qx=q[0], qy=q[1], qz=q[2], qw=q[3];
+            const ix = qw*x + qy*z - qz*y;
+            const iy = qw*y + qz*x - qx*z;
+            const iz = qw*z + qx*y - qy*x;
+            const iw = -qx*x - qy*y - qz*z;
+            out[0] = ix*qw + iw*-qx + iy*-qz - iz*-qy;
+            out[1] = iy*qw + iw*-qy + iz*-qx - ix*-qz;
+            out[2] = iz*qw + iw*-qz + ix*-qy - iy*-qx;
+            return out;
+        }
+    };
 
-        // Chart Initialization
-        const chartConfig = (label, colors) => ({
-            type: 'line',
-            data: {
-                labels: Array(MAX_POINTS).fill(''),
-                datasets: ['X', 'Y', 'Z'].map((ax, i) => ({
-                    label: `${label} ${ax}`,
-                    borderColor: colors[i],
-                    data: Array(MAX_POINTS).fill(0),
-                    borderWidth: 2,
-                    pointRadius: 0
-                }))
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                animation: false,
-                scales: { y: { grid: { color: '#333' } }, x: { display: false } },
-                plugins: { legend: { labels: { color: '#fff', boxWidth: 10 } } }
-            }
-        });
-
-        const posChart = new Chart(document.getElementById('posChart'), chartConfig('Pos', ['#ff5555', '#55ff55', '#5555ff']));
-        const angChart = new Chart(document.getElementById('angChart'), chartConfig('Ang', ['#ffcc00', '#00cccc', '#ff00ff']));
-
-        document.getElementById('start').onclick = async () => {
-            if (typeof DeviceOrientationEvent.requestPermission === 'function') await DeviceOrientationEvent.requestPermission();
-            document.getElementById('start').style.display = 'none';
-            window.addEventListener('devicemotion', update);
-        };
-
-        function update(event) {
-            const now = performance.now();
-            if (lastT === 0) { lastT = now; return; }
-            const dt = (now - lastT) / 1000;
-            lastT = now;
-
-            // 1. Orientation Fusion
-            const gr = event.rotationRate;
-            const acc = event.accelerationIncludingGravity;
-            madgwick.update(gr.alpha * (Math.PI/180), gr.beta * (Math.PI/180), gr.gamma * (Math.PI/180), acc.x, acc.y, acc.z);
-
-            // 2. Position Integration (ZUPT Logic)
-            let lin_acc_body = vec3.fromValues(event.acceleration.x, event.acceleration.y, event.acceleration.z);
-            let lin_acc_world = vec3.create();
-            const q = madgwick.conj();
-            vec3.transformQuat(lin_acc_world, lin_acc_body, [q.x, q.y, q.z, q.w]);
-
-            if (vec3.length(lin_acc_body) < 0.15) {
-                vec3.scale(velocity, velocity, 0.9);
-            } else {
-                let dv = vec3.create();
-                vec3.scale(dv, lin_acc_world, dt);
-                vec3.add(velocity, velocity, dv);
-            }
-
-            let dp = vec3.create();
-            vec3.scale(dp, velocity, dt);
-            vec3.add(position, position, dp);
-
-            // 3. Update Graphs
-            const euler = madgwick.getEulerAngles();
-            updateChart(posChart, [position[0], position[1], position[2]]);
-            updateChart(angChart, [euler.pitch * 57.3, euler.roll * 57.3, euler.yaw * 57.3]);
-            
-            document.getElementById('posVal').innerText = `POS: ${position[0].toFixed(2)}, ${position[1].toFixed(2)}, ${position[2].toFixed(2)}`;
-            document.getElementById('angVal').innerText = `ANG: ${Math.round(euler.pitch*57.3)}, ${Math.round(euler.roll*57.3)}, ${Math.round(euler.yaw*57.3)}`;
+    // ── Inline Madgwick AHRS filter ──────────────────────────────
+    class MadgwickAHRS {
+        constructor(beta = 0.4) {
+            this.beta = beta;
+            this.q = [1, 0, 0, 0]; // w, x, y, z
         }
 
-        function updateChart(chart, newData) {
-            chart.data.datasets.forEach((dataset, i) => {
-                dataset.data.push(newData[i]);
-                dataset.data.shift();
-            });
-            chart.update('none'); // 'none' for performance
+        update(gx, gy, gz, ax, ay, az, dt) {
+            let [qw, qx, qy, qz] = this.q;
+
+            // Normalize accelerometer
+            let norm = Math.sqrt(ax*ax + ay*ay + az*az);
+            if (norm === 0) return;
+            ax /= norm; ay /= norm; az /= norm;
+
+            // Gradient descent corrective step
+            const _2qw=2*qw, _2qx=2*qx, _2qy=2*qy, _2qz=2*qz;
+            const _4qw=4*qw, _4qx=4*qx, _4qy=4*qy;
+            const _8qx=8*qx, _8qy=8*qy;
+            const qwqw=qw*qw, qxqx=qx*qx, qyqy=qy*qy, qzqz=qz*qz;
+
+            let s0 = _4qw*qyqy + _2qy*ax + _4qw*qxqx - _2qx*ay;
+            let s1 = _4qx*qzqz - _2qz*ax + 4*qwqw*qx - _2qw*ay - _4qx + _8qx*qxqx + _8qx*qyqy + _4qx*az;
+            let s2 = 4*qwqw*qy + _2qw*ax + _4qy*qzqz - _2qz*ay - _4qy + _8qy*qxqx + _8qy*qyqy + _4qy*az;
+            let s3 = 4*qxqx*qz - _2qx*ax + 4*qyqy*qz - _2qy*ay;
+
+            norm = Math.sqrt(s0*s0 + s1*s1 + s2*s2 + s3*s3);
+            if (norm > 0) { s0 /= norm; s1 /= norm; s2 /= norm; s3 /= norm; }
+
+            // Rate of change of quaternion from gyroscope
+            const qDot0 = 0.5 * (-qx*gx - qy*gy - qz*gz) - this.beta * s0;
+            const qDot1 = 0.5 * ( qw*gx + qy*gz - qz*gy) - this.beta * s1;
+            const qDot2 = 0.5 * ( qw*gy - qx*gz + qz*gx) - this.beta * s2;
+            const qDot3 = 0.5 * ( qw*gz + qx*gy - qy*gx) - this.beta * s3;
+
+            // Integrate
+            qw += qDot0 * dt;
+            qx += qDot1 * dt;
+            qy += qDot2 * dt;
+            qz += qDot3 * dt;
+
+            // Normalize quaternion
+            norm = Math.sqrt(qw*qw + qx*qx + qy*qy + qz*qz);
+            this.q = [qw/norm, qx/norm, qy/norm, qz/norm];
         }
+
+        getQuatConjXYZW() {
+            const [w, x, y, z] = this.q;
+            return [-x, -y, -z, w]; // conjugate in [x,y,z,w] format for vec3.transformQuat
+        }
+
+        getEulerDeg() {
+            const [w, x, y, z] = this.q;
+            const sinr_cosp = 2 * (w*x + y*z);
+            const cosr_cosp = 1 - 2 * (x*x + y*y);
+            const roll = Math.atan2(sinr_cosp, cosr_cosp);
+
+            const sinp = 2 * (w*y - z*x);
+            const pitch = Math.abs(sinp) >= 1 ? Math.sign(sinp) * Math.PI/2 : Math.asin(sinp);
+
+            const siny_cosp = 2 * (w*z + x*y);
+            const cosy_cosp = 1 - 2 * (y*y + z*z);
+            const yaw = Math.atan2(siny_cosp, cosy_cosp);
+
+            const toDeg = 180 / Math.PI;
+            return { pitch: pitch * toDeg, roll: roll * toDeg, yaw: yaw * toDeg };
+        }
+    }
+
+    // ── Main app ─────────────────────────────────────────────────
+    const statusEl = document.getElementById('status');
+    const madgwick = new MadgwickAHRS(0.4);
+
+    let position = [0, 0, 0];
+    let velocity = [0, 0, 0];
+    let lastT = 0;
+    const MAX_POINTS = 100;
+
+    // High-pass filter for Android (event.acceleration is often null)
+    const HP_ALPHA = 0.8;
+    let gravity = null;
+
+    const chartConfig = (label, colors) => ({
+        type: 'line',
+        data: {
+            labels: Array(MAX_POINTS).fill(''),
+            datasets: ['X', 'Y', 'Z'].map((ax, i) => ({
+                label: `${label} ${ax}`,
+                borderColor: colors[i],
+                data: Array(MAX_POINTS).fill(0),
+                borderWidth: 2,
+                pointRadius: 0
+            }))
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: false,
+            scales: { y: { grid: { color: '#333' } }, x: { display: false } },
+            plugins: { legend: { labels: { color: '#fff', boxWidth: 10 } } }
+        }
+    });
+
+    const posChart = new Chart(document.getElementById('posChart'), chartConfig('Pos', ['#ff5555', '#55ff55', '#5555ff']));
+    const angChart = new Chart(document.getElementById('angChart'), chartConfig('Ang', ['#ffcc00', '#00cccc', '#ff00ff']));
+
+    document.getElementById('start').onclick = async () => {
+        try {
+            if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function')
+                await DeviceMotionEvent.requestPermission();
+        } catch(e) { statusEl.innerText = 'Permission error: ' + e.message; }
+        document.getElementById('start').style.display = 'none';
+        statusEl.innerText = 'Waiting for sensor data...';
+        window.addEventListener('devicemotion', onMotion);
+    };
+
+    function getLinearAccel(event) {
+        if (event.acceleration && event.acceleration.x != null)
+            return V3.from(event.acceleration.x, event.acceleration.y, event.acceleration.z);
+
+        const ag = event.accelerationIncludingGravity;
+        if (!ag || ag.x == null) return null;
+        if (!gravity) gravity = { x: ag.x, y: ag.y, z: ag.z };
+
+        gravity.x = HP_ALPHA * gravity.x + (1 - HP_ALPHA) * ag.x;
+        gravity.y = HP_ALPHA * gravity.y + (1 - HP_ALPHA) * ag.y;
+        gravity.z = HP_ALPHA * gravity.z + (1 - HP_ALPHA) * ag.z;
+
+        return V3.from(ag.x - gravity.x, ag.y - gravity.y, ag.z - gravity.z);
+    }
+
+    function onMotion(event) {
+        const now = performance.now();
+        if (lastT === 0) { lastT = now; return; }
+        const dt = (now - lastT) / 1000;
+        lastT = now;
+
+        const gr = event.rotationRate;
+        const acc = event.accelerationIncludingGravity;
+        if (!gr || !acc) { statusEl.innerText = 'No sensor data'; return; }
+        if (gr.alpha == null || acc.x == null) { statusEl.innerText = 'Null sensor values'; return; }
+
+        statusEl.innerText = '';
+
+        // 1. Orientation fusion (gyro in rad/s)
+        madgwick.update(
+            gr.alpha * (Math.PI / 180),
+            gr.beta  * (Math.PI / 180),
+            gr.gamma * (Math.PI / 180),
+            acc.x, acc.y, acc.z, dt
+        );
+
+        // 2. Position integration with ZUPT
+        const linAcc = getLinearAccel(event);
+        if (!linAcc) return;
+
+        const linWorld = V3.create();
+        V3.transformQuat(linWorld, linAcc, madgwick.getQuatConjXYZW());
+
+        if (V3.len(linAcc) < 0.15) {
+            V3.scale(velocity, velocity, 0.9);
+        } else {
+            const dv = V3.create();
+            V3.scale(dv, linWorld, dt);
+            V3.add(velocity, velocity, dv);
+        }
+
+        const dp = V3.create();
+        V3.scale(dp, velocity, dt);
+        V3.add(position, position, dp);
+
+        // 3. Update graphs
+        const euler = madgwick.getEulerDeg();
+        updateChart(posChart, [position[0], position[1], position[2]]);
+        updateChart(angChart, [euler.pitch, euler.roll, euler.yaw]);
+
+        document.getElementById('posVal').innerText = `POS: ${position[0].toFixed(2)}, ${position[1].toFixed(2)}, ${position[2].toFixed(2)}`;
+        document.getElementById('angVal').innerText = `ANG: ${Math.round(euler.pitch)}, ${Math.round(euler.roll)}, ${Math.round(euler.yaw)}`;
+    }
+
+    function updateChart(chart, newData) {
+        chart.data.datasets.forEach((ds, i) => { ds.data.push(newData[i]); ds.data.shift(); });
+        chart.update('none');
+    }
     </script>
 </body>
 </html>
